@@ -20,20 +20,54 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { buildMcpServer, getConfig } from "../src/server.js";
 
 export const config = {
-  // 60s on Vercel Pro, 10s on Hobby. Bulk operations with many offers may exceed this.
+  // Pro tier ceiling. Hobby caps at 10s, which is too tight for bulk_create_offers.
   maxDuration: 60,
 };
 
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin":  "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": [
+    "Content-Type",
+    "Accept",
+    "Authorization",
+    "mcp-session-id",
+    "mcp-protocol-version",
+    "x-adobe-client-id",
+    "x-adobe-client-secret",
+    "x-adobe-org-id",
+    "x-adobe-sandbox",
+    "x-adobe-tenant-id",
+    "x-adobe-schema-uri",
+    "x-adobe-schema-alt-id",
+    "x-adobe-catalog-id",
+    "x-adobe-offer-class",
+    "x-adobe-access-token",
+  ].join(", "),
+  "Access-Control-Max-Age": "86400",
+};
+
+function applyCors(res) {
+  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+}
+
 export default async function handler(req, res) {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers",
-    "Content-Type, Authorization, mcp-session-id, mcp-protocol-version, " +
-    "x-adobe-client-id, x-adobe-client-secret, x-adobe-org-id, x-adobe-sandbox, " +
-    "x-adobe-tenant-id, x-adobe-schema-uri, x-adobe-schema-alt-id, " +
-    "x-adobe-catalog-id, x-adobe-offer-class, x-adobe-access-token"
-  );
+  applyCors(res);
+
   if (req.method === "OPTIONS") { res.statusCode = 204; res.end(); return; }
+
+  // Plain GET — show usage so curious browsers don't see a confusing error.
+  if (req.method === "GET") {
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({
+      server: "exd-accelerator",
+      version: "2.0.0",
+      transport: "streamable-http",
+      message: "POST JSON-RPC 2.0 here. See https://github.com/Vikas-O7/exd-accelerator-mcp for setup.",
+    }));
+    return;
+  }
 
   try {
     const userConfig = getConfig(req.headers || {});
