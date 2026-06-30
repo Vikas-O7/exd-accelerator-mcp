@@ -1,8 +1,10 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/mcp.js": {
-      "maxDuration": 60
-    }
-  }
+  "version": 2,
+  "builds": [
+    { "src": "api/mcp.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/api/mcp(/.*)?", "dest": "/api/mcp.js" }
+  ]
 }
