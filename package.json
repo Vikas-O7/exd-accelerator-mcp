@@ -1,0 +1,22 @@
+{
+  "name": "exd-accelerator-mcp",
+  "version": "2.0.0",
+  "description": "ExD Accelerator — AI-native Experience Decisioning MCP server. Stdio for Claude Desktop, Streamable HTTP for Vercel.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start":    "node src/stdio.js",
+    "stdio":    "node src/stdio.js",
+    "dev:http": "node src/http-local.js",
+    "smoke":    "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "dotenv": "^17.4.2",
+    "papaparse": "^5.4.1",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

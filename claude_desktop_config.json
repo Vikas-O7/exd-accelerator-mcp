@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "exd-accelerator": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/exd-mcp-server/src/stdio.js"],
+      "env": {
+        "CLIENT_ID":                 "your-adobe-client-id",
+        "CLIENT_SECRET":             "your-adobe-client-secret",
+        "ORG_ID":                    "your-ims-org-id@AdobeOrg",
+        "SANDBOX_NAME":              "your-sandbox",
+        "TENANT_ID":                 "yourtenantid",
+        "DECISIONING_SCHEMA_URI":    "https://ns.adobe.com/yourtenantid/schemas/xxx",
+        "DECISIONING_SCHEMA_ALT_ID": "_yourtenantid.schemas.xxx",
+        "ITEM_CATALOG_ID":           "xcore:decision-catalog:xxx"
+      }
+    }
+  }
+}
