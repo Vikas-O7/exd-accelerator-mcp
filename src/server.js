@@ -140,19 +140,29 @@ function schemaHeaders(token, config, accept) {
   };
 }
 
-// ─── HTTP CALL with safe error handling ───────────────────────────────────────
-async function apiCall(url, method, headers, body) {
+// ─── HTTP CALL with safe error handling + single retry on 5xx ─────────────────
+// Adobe Platform APIs occasionally return transient 502/503/504. One retry with
+// a short backoff turns those into a non-event for the caller.
+async function apiCall(url, method, headers, body, { retry = true } = {}) {
   const opts = { method, headers };
   if (body !== undefined) opts.body = JSON.stringify(body);
-  try {
-    const res = await fetch(url, opts);
-    const text = await res.text();
-    let json;
-    try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-    return { status: res.status, ok: res.ok, body: json };
-  } catch (e) {
-    return { status: 0, ok: false, body: { error: "network_error", message: e.message } };
+  async function attempt() {
+    try {
+      const res = await fetch(url, opts);
+      const text = await res.text();
+      let json;
+      try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+      return { status: res.status, ok: res.ok, body: json };
+    } catch (e) {
+      return { status: 0, ok: false, body: { error: "network_error", message: e.message } };
+    }
   }
+  const first = await attempt();
+  if (retry && (first.status === 0 || first.status === 502 || first.status === 503 || first.status === 504)) {
+    await new Promise(r => setTimeout(r, 400));
+    return attempt();
+  }
+  return first;
 }
 
 function extractItems(body) {
@@ -502,11 +512,20 @@ This will POST ${payloads.length} requests to /offer-items.`;
       const check = needsConfirmation(confirmed, preview);
       if (check) return check;
 
+      // Run in chunks so we don't blow past Vercel's 60s function timeout on
+      // large CSVs, but stay well under DPS rate limits.
+      const CHUNK_SIZE = 5;
       const results = [], errors = [];
-      for (let i = 0; i < payloads.length; i++) {
-        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items`, "POST", offerItemHeaders(token, cfg), payloads[i].payload);
-        if (res.ok) results.push({ name: payloads[i].name, id: res.body.id });
-        else        errors.push({ name: payloads[i].name, error: JSON.stringify(res.body) });
+      for (let i = 0; i < payloads.length; i += CHUNK_SIZE) {
+        const chunk = payloads.slice(i, i + CHUNK_SIZE);
+        const settled = await Promise.all(chunk.map(p =>
+          apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items`, "POST", offerItemHeaders(token, cfg), p.payload)
+            .then(res => ({ p, res }))
+        ));
+        for (const { p, res } of settled) {
+          if (res.ok) results.push({ name: p.name, id: res.body.id });
+          else        errors.push({ name: p.name, error: JSON.stringify(res.body) });
+        }
       }
 
       return { content: [{ type: "text", text:
