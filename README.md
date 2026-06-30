@@ -1,5 +1,9 @@
 # ExD Accelerator — MCP Server
 
+[![ci](https://github.com/Vikas-O7/exd-accelerator-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Vikas-O7/exd-accelerator-mcp/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg)](.nvmrc)
+
 AI-native Experience Decisioning lifecycle automation for Adobe Journey Optimizer.
 End-to-end ExD setup from a single chat conversation: CSV → schema fields → offers →
 collections → eligibility rules → ranking → selection strategy → placements.
@@ -7,6 +11,9 @@ collections → eligibility rules → ranking → selection strategy → placeme
 **21 MCP tools** wrapping AEP Schema Registry and Decisioning APIs. Every write
 operation previews what it will do and requires explicit `confirmed: true` before
 executing.
+
+**Live endpoint:** `https://exd-mcp-server-without-auth.vercel.app/api/mcp`
+**Health:** `https://exd-mcp-server-without-auth.vercel.app/api/health`
 
 ---
 

@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke:
+    name: smoke (stdio + http, no Adobe APIs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # Runs initialize, tools/list, no-network tool calls (parse_csv_and_suggest,
+      # bulk_create_offers dry_run, confirmation guard). CI has no .env, so the
+      # smoke driver naturally branches into the "no creds" assertions.
+      - name: smoke
+        run: npm run smoke:ci

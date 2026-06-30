@@ -1,0 +1,12 @@
+.env
+.env.*
+.git
+.gitignore
+.github
+.vscode
+.idea
+*.log
+HANDOVER.md
+CONTRIBUTING.md
+scripts/smoke.js
+claude_desktop_config.example.json
