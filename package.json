@@ -3,7 +3,6 @@
   "version": "2.0.0",
   "description": "ExD Accelerator — AI-native Experience Decisioning MCP server. Stdio for Claude Desktop, Streamable HTTP for Vercel.",
   "type": "module",
-  "main": "src/server.js",
   "scripts": {
     "start":    "node src/stdio.js",
     "stdio":    "node src/stdio.js",
