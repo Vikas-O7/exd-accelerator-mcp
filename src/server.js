@@ -717,7 +717,7 @@ This will POST to /selection-strategies.`);
         {
           name, description,
           rank: ranking_formula_id
-            ? { priority, order:{ orderEvaluationType:"formula", rankingStrategy:ranking_formula_id } }
+            ? { priority, order:{ orderEvaluationType:"rankingStrategy", rankingStrategy:ranking_formula_id } }
             : { priority, order:{ orderEvaluationType:"static" } },
           profileConstraint: eligibility_rule_id
             ? { profileConstraintType:"eligibilityRule", eligibilityRule:eligibility_rule_id }
