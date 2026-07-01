@@ -13,6 +13,22 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import Papa from "papaparse";
 
+// Some MCP clients (Adobe Coworker at time of writing) serialize boolean tool
+// arguments as strings — "true"/"false" instead of true/false. z.boolean()
+// rejects those, which surfaces as a "type coercion bug" to the caller. This
+// schema accepts either form and normalizes to a real boolean.
+const boolish = (defaultValue = false) => z.preprocess((v) => {
+  if (typeof v === "boolean") return v;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (s === "true"  || s === "1" || s === "yes") return true;
+    if (s === "false" || s === "0" || s === "no"  || s === "") return false;
+  }
+  if (v === 1) return true;
+  if (v === 0 || v == null) return false;
+  return v; // let zod reject anything else with a clear error
+}, z.boolean()).default(defaultValue);
+
 // ─── HEADER → CONFIG MAP ──────────────────────────────────────────────────────
 // Headers win over env vars so a single Vercel deployment can serve multiple users
 // who each supply their own credentials.
@@ -338,7 +354,7 @@ ${ranking.map((r,i) => `  ${i+1}. "${r.name}" — ${r.why}`).join("\n")}
     {
       csv_text:        z.string().describe("Full CSV text — column names become schema fields"),
       fieldgroup_name: z.string().default("Offer Metadata - CSV Import").describe("Display name for the new fieldgroup"),
-      confirmed:       z.boolean().default(false).describe("Set to true to execute. Leave false to preview only."),
+      confirmed:       boolish().describe("Set to true to execute. Leave false to preview only."),
       access_token:    z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
     wrap(async ({ csv_text, fieldgroup_name, confirmed, access_token }) => {
@@ -434,8 +450,8 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
     {
       csv_text:         z.string().describe("Full CSV text"),
       lifecycle_status: z.enum(["draft","live","archived"]).default("draft"),
-      dry_run:          z.boolean().default(false).describe("Returns full JSON payloads without calling the API"),
-      confirmed:        z.boolean().default(false).describe("Set to true to execute the write. Leave false to preview."),
+      dry_run:          boolish().describe("Returns full JSON payloads without calling the API"),
+      confirmed:        boolish().describe("Set to true to execute the write. Leave false to preview."),
       access_token:     z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
     wrap(async ({ csv_text, lifecycle_status, dry_run, confirmed, access_token }) => {
@@ -547,7 +563,7 @@ Next: Say "create collections" to group these offers.` }] };
       filter_type:       z.enum(["all","by_name","by_category","by_custom_field","by_priority_gte"]).describe("How to filter offers into this collection"),
       filter_value:      z.string().optional().describe("Value to filter on — required for all filter types except 'all'"),
       custom_field_path: z.string().optional().describe("Tenant field path for by_custom_field e.g. category"),
-      confirmed:         z.boolean().default(false).describe("Set to true to execute the write."),
+      confirmed:         boolish().describe("Set to true to execute the write."),
       access_token:      z.string().optional(),
     },
     wrap(async ({ name, description, filter_type, filter_value, custom_field_path, confirmed, access_token }) => {
@@ -599,7 +615,7 @@ Filter : ${filter_type}${filter_value ? ` = "${filter_value}"` : ""}
       name:           z.string().describe("Rule display name"),
       description:    z.string().default(""),
       pql_expression: z.string().describe("PQL expression e.g. profile.loyaltyTier.in([\"gold\",\"platinum\"]) or true for all visitors"),
-      confirmed:      z.boolean().default(false),
+      confirmed:      boolish(),
       access_token:   z.string().optional(),
     },
     wrap(async ({ name, description, pql_expression, confirmed, access_token }) => {
@@ -638,7 +654,7 @@ PQL  : ${pql_expression}
       formula_type:      z.enum(["static_priority","custom_field","recency_priority_hybrid","custom_pql"]),
       custom_field_name: z.string().optional(),
       custom_pql:        z.string().optional(),
-      confirmed:         z.boolean().default(false),
+      confirmed:         boolish(),
       access_token:      z.string().optional(),
     },
     wrap(async ({ name, description, formula_type, custom_field_name, custom_pql, confirmed, access_token }) => {
@@ -694,7 +710,7 @@ PQL  : ${pql}
       eligibility_rule_id: z.string().optional().describe("ID of the eligibility rule. Omit for all visitors."),
       ranking_formula_id:  z.string().optional().describe("ID of the ranking formula. Omit for static priority."),
       priority:            z.number().default(1).describe("Static priority score (1 = highest) when no ranking formula is set"),
-      confirmed:           z.boolean().default(false),
+      confirmed:           boolish(),
       access_token:        z.string().optional(),
     },
     wrap(async ({ name, description, collection_id, eligibility_rule_id, ranking_formula_id, priority, confirmed, access_token }) => {
@@ -752,7 +768,7 @@ Ranking     : ${ranking_formula_id  || "Static priority"}
         "https://ns.adobe.com/xdm/channel-types/in-app",
       ]),
       status:       z.enum(["active","archived"]).default("active"),
-      confirmed:    z.boolean().default(false),
+      confirmed:    boolish(),
       access_token: z.string().optional(),
     },
     wrap(async ({ name, description, channel, status, confirmed, access_token }) => {
@@ -845,7 +861,7 @@ ${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""
         path:  z.string(),
         value: z.any().optional(),
       })),
-      confirmed:    z.boolean().default(false),
+      confirmed:    boolish(),
       access_token: z.string().optional(),
     },
     wrap(async ({ offer_id, patches, confirmed, access_token }) => {
@@ -881,7 +897,7 @@ This will PATCH /offer-items/${offer_id}.`);
       field_description: z.string().default(""),
       field_type:        z.enum(["string","integer","number","boolean"]).default("string"),
       definition_key:    z.string().default("offerMetadata"),
-      confirmed:         z.boolean().default(false),
+      confirmed:         boolish(),
       access_token:      z.string().optional(),
     },
     wrap(async ({ fieldgroup_id, field_name, field_title, field_description, field_type, definition_key, confirmed, access_token }) => {
@@ -921,7 +937,7 @@ This will PATCH /tenant/fieldgroups/${fieldgroup_id}.`);
       fieldgroup_id:  z.string(),
       field_name:     z.string(),
       definition_key: z.string().default("offerMetadata"),
-      confirmed:      z.boolean().default(false),
+      confirmed:      boolish(),
       access_token:   z.string().optional(),
     },
     wrap(async ({ fieldgroup_id, field_name, definition_key, confirmed, access_token }) => {
@@ -965,7 +981,7 @@ Status     : deprecated` }] };
     "Deprecate an OOB Adobe-managed field on the decisioning schema via a descriptor. Use for standard fields like itemDescription, itemName. For custom tenant fields use deprecate_schema_field. Requires confirmed: true.",
     {
       field_path:   z.string().describe("JSON pointer path to the field e.g. /_experience/decisioning/decisionitem/itemDescription"),
-      confirmed:    z.boolean().default(false),
+      confirmed:    boolish(),
       access_token: z.string().optional(),
     },
     wrap(async ({ field_path, confirmed, access_token }) => {
@@ -1006,7 +1022,7 @@ Descriptor  : ${res.body["@id"] || res.body.id || "created"}` }] };
     "Safely remove a fieldgroup from the decisioning schema. Always shows a dry-run preview first. Requires confirmed: true to execute the removal.",
     {
       fieldgroup_id: z.string().describe("Fieldgroup meta:altId OR full $id URI to detach"),
-      confirmed:     z.boolean().default(false),
+      confirmed:     boolish(),
       access_token:  z.string().optional(),
     },
     wrap(async ({ fieldgroup_id, confirmed, access_token }) => {
@@ -1176,7 +1192,7 @@ ${fmt(placementsRes, "Placements")}
   server.tool("lookup_decisioning_schema",
     "Fetch the full resolved Personalized Offer Items decisioning schema — all fieldgroups, OOB fields, and custom tenant fields. Read-only.",
     {
-      include_deprecated: z.boolean().default(false),
+      include_deprecated: boolish(),
       access_token:       z.string().optional(),
     },
     wrap(async ({ include_deprecated, access_token }) => {
@@ -1283,7 +1299,7 @@ ${debugBlock}
   server.tool("list_schema_fieldgroups",
     "List all tenant fieldgroups compatible with the Offer Item class. Read-only.",
     {
-      include_global: z.boolean().default(false),
+      include_global: boolish(),
       access_token:   z.string().optional(),
     },
     wrap(async ({ include_global, access_token }) => {
