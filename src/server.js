@@ -156,12 +156,17 @@ function schemaHeaders(token, config, accept) {
   };
 }
 
-// ─── HTTP CALL with safe error handling + retry on transient + 429 ───────────
-// Adobe Platform APIs occasionally return transient 502/503/504. One retry
-// turns those into a non-event for the caller.
+// ─── HTTP CALL with safe error handling + retries ─────────────────────────────
+// Adobe Platform APIs return three flavors of retriable failure at scale:
+//   - 502/503/504 or network errors → transient infra hiccup
+//   - 429 with Retry-After header    → rate limit, honor the header
+//   - 409 "Entity update has conflict with another operation"
+//                                     → DPS catalog write-lock contention when
+//                                       multiple parallel POSTs hit the same
+//                                       catalog. Common with bulk_create_offers.
 //
-// On 429 (rate limit), respect the Retry-After header (or default 1s) and try
-// once. If we still get 429 after that, surface it — caller has to back off.
+// We do up to 2 retries for 409/429 (with exponential backoff) and 1 retry for
+// 5xx. Anything still failing after that surfaces to the caller.
 async function apiCall(url, method, headers, body, { retry = true } = {}) {
   const opts = { method, headers };
   if (body !== undefined) opts.body = JSON.stringify(body);
@@ -179,23 +184,27 @@ async function apiCall(url, method, headers, body, { retry = true } = {}) {
     }
   }
 
-  const first = await attempt();
-  if (!retry) return first;
+  let last = await attempt();
+  if (!retry) return last;
 
-  // Transient 5xx / network error → short backoff, one retry
-  if (first.status === 0 || first.status === 502 || first.status === 503 || first.status === 504) {
-    await new Promise(r => setTimeout(r, 400));
-    return attempt();
+  const backoffFor = (attemptNum, status, hdr) => {
+    if (status === 429) return Math.min(10_000, Math.max(500, (parseInt(hdr, 10) || 1) * 1000));
+    if (status === 409) return 300 + 500 * attemptNum + Math.floor(Math.random() * 300); // jittered
+    return 400; // 5xx / network
+  };
+
+  for (let i = 1; i <= 2; i++) {
+    const s = last.status;
+    const isRetriable = s === 0 || s === 429 || s === 409 || s === 502 || s === 503 || s === 504;
+    if (!isRetriable) break;
+    // For plain transient 5xx / network, only bother with one retry
+    if (i > 1 && (s === 0 || s === 502 || s === 503 || s === 504)) break;
+    await new Promise(r => setTimeout(r, backoffFor(i, s, last.retryAfter)));
+    last = await attempt();
+    if (last.ok) break;
   }
 
-  // Rate limit → respect Retry-After (seconds), cap at 10s so we don't hang the caller
-  if (first.status === 429) {
-    const waitMs = Math.min(10_000, Math.max(500, (parseInt(first.retryAfter, 10) || 1) * 1000));
-    await new Promise(r => setTimeout(r, waitMs));
-    return attempt();
-  }
-
-  return first;
+  return last;
 }
 
 function extractItems(body) {
@@ -463,22 +472,29 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
 
   // ════════ TOOL 3 — bulk_create_offers ════════════════════════════════════════
   server.tool("bulk_create_offers",
-    "Bulk-create ExD offer items from CSV rows. Each row becomes one offer. Requires confirmed: true to execute — previews payloads first. Use dry_run: true to inspect full JSON payloads.",
+    "Bulk-create ExD offer items from CSV rows. Each row becomes one offer. Requires confirmed: true to execute — previews payloads first. Use dry_run: true to inspect full JSON payloads. Supports large CSVs (100+) via offset/limit pagination: each call processes up to ~40 offers within Adobe I/O Runtime's 60s function cap, then returns a 'call again with offset:X' hint. LLMs should chain calls automatically for big batches.",
     {
       csv_text:         z.string().describe("Full CSV text"),
       lifecycle_status: z.enum(["draft","live","archived"]).default("draft"),
       dry_run:          boolish().describe("Returns full JSON payloads without calling the API"),
       confirmed:        boolish().describe("Set to true to execute the write. Leave false to preview."),
-      chunk_size:       z.number().int().min(1).max(20).default(5).describe("How many offers to POST in parallel. Default 5, max 20. Larger = faster on big CSVs but risks 429 rate-limits on Adobe DPS."),
+      chunk_size:       z.number().int().min(1).max(20).default(10).describe("How many offers to POST in parallel per chunk. Default 10, max 20. Larger = faster on big CSVs but risks 429 rate-limits on Adobe DPS (which the retry loop handles)."),
+      offset:           z.number().int().min(0).default(0).describe("Skip this many CSV rows before processing. Use for pagination on big CSVs."),
+      limit:            z.number().int().min(1).max(200).default(50).describe("Process at most this many rows in this call. Default 50 (safely fits Adobe's 60s function cap). Set higher only if you know your CSV is small."),
       access_token:     z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
-    wrap(async ({ csv_text, lifecycle_status, dry_run, confirmed, chunk_size, access_token }) => {
+    wrap(async ({ csv_text, lifecycle_status, dry_run, confirmed, chunk_size, offset, limit, access_token }) => {
       // Validate config up front so dry_run users get a clear error too.
       const { cfg, token } = dry_run && !confirmed
         ? { cfg: { ...config, ...(describeMissingConfig(config).length ? {} : {}) }, token: null }
         : await requireApiConfig({ access_token });
 
-      const { columns, rows } = parseCSV(csv_text);
+      const { columns, rows: allRows } = parseCSV(csv_text);
+      const totalRows = allRows.length;
+      const startIdx  = Math.min(offset, totalRows);
+      const endIdx    = Math.min(offset + limit, totalRows);
+      const rows      = allRows.slice(startIdx, endIdx);
+
       const colLower  = col => col.toLowerCase().replace(/[^a-z0-9_]/g, "_");
       const colMap    = {};
       for (const c of columns) colMap[colLower(c)] = c;
@@ -528,29 +544,40 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
         });
       }
 
-      if (dry_run) return { content: [{ type: "text", text:
-`🔍 DRY RUN — ${payloads.length} offers would be created (status: ${lifecycle_status}):
-${payloads.map((p,i) => `Row ${i+1}: "${p.name}"\n${JSON.stringify(p.payload, null, 2)}`).join("\n\n")}
+      const window = `rows ${startIdx + 1}-${endIdx} of ${totalRows}`;
+
+      if (dry_run) {
+        // Trim preview for big batches to keep the response readable
+        const previewPayloads = payloads.slice(0, Math.min(10, payloads.length));
+        const truncated = payloads.length > previewPayloads.length;
+        return { content: [{ type: "text", text:
+`🔍 DRY RUN — ${payloads.length} offers would be created (window: ${window}, status: ${lifecycle_status}):
+${previewPayloads.map((p,i) => `Row ${startIdx + i + 1}: "${p.name}"\n${JSON.stringify(p.payload, null, 2)}`).join("\n\n")}
+${truncated ? `\n... (${payloads.length - previewPayloads.length} more rows in this window not shown)` : ""}
 
 Call again with dry_run: false and confirmed: true to execute.` }] };
+      }
 
-      const preview = `OFFERS TO CREATE: ${payloads.length} offer items
+      const preview = `OFFERS TO CREATE: ${payloads.length} (window: ${window})
 Status   : ${lifecycle_status}
 Sandbox  : ${cfg.SANDBOX_NAME}
 Catalog  : ${cfg.ITEM_CATALOG_ID}
 
 OFFER NAMES:
-${payloads.map((p,i) => `  ${i+1}. ${p.name}`).join("\n")}
+${payloads.slice(0, 10).map((p,i) => `  ${startIdx + i + 1}. ${p.name}`).join("\n")}${payloads.length > 10 ? `\n  ... (${payloads.length - 10} more)` : ""}
 
-This will POST ${payloads.length} requests to /offer-items.`;
+This will POST ${payloads.length} requests to /offer-items.${endIdx < totalRows ? `\n\n⚠️ CSV has ${totalRows} rows but only ${limit} will be processed this call. After confirming, you'll get a 'call again with offset:${endIdx}' hint to continue.` : ""}`;
       const check = needsConfirmation(confirmed, preview);
       if (check) return check;
 
-      // Run in chunks so we don't blow past App Builder / Vercel's 60s function
-      // timeout on large CSVs, but stay well under DPS rate limits. Caller can
-      // tune chunk_size (default 5, max 20). apiCall retries once on 429.
+      // Run in chunks; also enforce a soft deadline so we return partial results
+      // gracefully instead of getting killed at 60s.
+      const SOFT_DEADLINE_MS = 55_000;
+      const t0 = Date.now();
       const results = [], errors = [];
+      let stopped = false;
       for (let i = 0; i < payloads.length; i += chunk_size) {
+        if (Date.now() - t0 > SOFT_DEADLINE_MS) { stopped = true; break; }
         const chunk = payloads.slice(i, i + chunk_size);
         const settled = await Promise.all(chunk.map(p =>
           apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items`, "POST", offerItemHeaders(token, cfg), p.payload)
@@ -562,13 +589,28 @@ This will POST ${payloads.length} requests to /offer-items.`;
         }
       }
 
-      return { content: [{ type: "text", text:
-`📦 BULK OFFER CREATION COMPLETE
-✅ Created : ${results.length}  |  ❌ Failed: ${errors.length}
-${results.map(r => `  ✅ "${r.name}" → ${r.id}`).join("\n")}
-${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ "${e.name}" → ${e.error}`).join("\n")}` : ""}
+      const processed  = results.length + errors.length;
+      const nextOffset = startIdx + processed;
+      const hasMore    = nextOffset < totalRows;
+      const wallSecs   = ((Date.now() - t0) / 1000).toFixed(1);
 
-Next: Say "create collections" to group these offers.` }] };
+      // Show at most 20 result lines to keep responses readable
+      const showResults = results.length <= 20
+        ? results.map(r => `  ✅ "${r.name}" → ${r.id}`).join("\n")
+        : results.slice(0, 10).map(r => `  ✅ "${r.name}" → ${r.id}`).join("\n") +
+          `\n  ... (${results.length - 20} more) ...\n` +
+          results.slice(-10).map(r => `  ✅ "${r.name}" → ${r.id}`).join("\n");
+
+      return { content: [{ type: "text", text:
+`📦 BULK OFFER CREATION ${stopped ? "PARTIAL (soft time budget reached)" : "COMPLETE"}
+Window   : ${window}
+Processed: ${processed} in ${wallSecs}s   ✅ ${results.length} created   ❌ ${errors.length} failed
+${showResults}
+${errors.length ? `\nErrors:\n${errors.slice(0, 5).map(e => `  ❌ "${e.name}" → ${e.error.slice(0, 200)}`).join("\n")}${errors.length > 5 ? `\n  ... (${errors.length - 5} more errors)` : ""}` : ""}
+
+${hasMore
+  ? `⏭️  ${totalRows - nextOffset} rows remaining. Call bulk_create_offers again with:\n     offset: ${nextOffset}  (and same csv_text, confirmed: true)\n`
+  : `✅ All ${totalRows} rows processed. Say "create collections" to group these offers.`}` }] };
     })
   );
 
