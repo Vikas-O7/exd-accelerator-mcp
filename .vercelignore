@@ -5,8 +5,13 @@
 .github
 .vscode
 .idea
+.aio
 *.log
 HANDOVER.md
 CONTRIBUTING.md
 scripts/smoke.js
 claude_desktop_config.example.json
+# App Builder deploy artifacts — irrelevant to Vercel
+actions/
+app.config.yaml
+dist/
