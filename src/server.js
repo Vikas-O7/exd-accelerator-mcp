@@ -156,28 +156,45 @@ function schemaHeaders(token, config, accept) {
   };
 }
 
-// ─── HTTP CALL with safe error handling + single retry on 5xx ─────────────────
-// Adobe Platform APIs occasionally return transient 502/503/504. One retry with
-// a short backoff turns those into a non-event for the caller.
+// ─── HTTP CALL with safe error handling + retry on transient + 429 ───────────
+// Adobe Platform APIs occasionally return transient 502/503/504. One retry
+// turns those into a non-event for the caller.
+//
+// On 429 (rate limit), respect the Retry-After header (or default 1s) and try
+// once. If we still get 429 after that, surface it — caller has to back off.
 async function apiCall(url, method, headers, body, { retry = true } = {}) {
   const opts = { method, headers };
   if (body !== undefined) opts.body = JSON.stringify(body);
+
   async function attempt() {
     try {
       const res = await fetch(url, opts);
       const text = await res.text();
       let json;
       try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-      return { status: res.status, ok: res.ok, body: json };
+      const retryAfter = res.headers.get("retry-after");
+      return { status: res.status, ok: res.ok, body: json, retryAfter };
     } catch (e) {
       return { status: 0, ok: false, body: { error: "network_error", message: e.message } };
     }
   }
+
   const first = await attempt();
-  if (retry && (first.status === 0 || first.status === 502 || first.status === 503 || first.status === 504)) {
+  if (!retry) return first;
+
+  // Transient 5xx / network error → short backoff, one retry
+  if (first.status === 0 || first.status === 502 || first.status === 503 || first.status === 504) {
     await new Promise(r => setTimeout(r, 400));
     return attempt();
   }
+
+  // Rate limit → respect Retry-After (seconds), cap at 10s so we don't hang the caller
+  if (first.status === 429) {
+    const waitMs = Math.min(10_000, Math.max(500, (parseInt(first.retryAfter, 10) || 1) * 1000));
+    await new Promise(r => setTimeout(r, waitMs));
+    return attempt();
+  }
+
   return first;
 }
 
@@ -452,9 +469,10 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
       lifecycle_status: z.enum(["draft","live","archived"]).default("draft"),
       dry_run:          boolish().describe("Returns full JSON payloads without calling the API"),
       confirmed:        boolish().describe("Set to true to execute the write. Leave false to preview."),
+      chunk_size:       z.number().int().min(1).max(20).default(5).describe("How many offers to POST in parallel. Default 5, max 20. Larger = faster on big CSVs but risks 429 rate-limits on Adobe DPS."),
       access_token:     z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
-    wrap(async ({ csv_text, lifecycle_status, dry_run, confirmed, access_token }) => {
+    wrap(async ({ csv_text, lifecycle_status, dry_run, confirmed, chunk_size, access_token }) => {
       // Validate config up front so dry_run users get a clear error too.
       const { cfg, token } = dry_run && !confirmed
         ? { cfg: { ...config, ...(describeMissingConfig(config).length ? {} : {}) }, token: null }
@@ -528,12 +546,12 @@ This will POST ${payloads.length} requests to /offer-items.`;
       const check = needsConfirmation(confirmed, preview);
       if (check) return check;
 
-      // Run in chunks so we don't blow past Vercel's 60s function timeout on
-      // large CSVs, but stay well under DPS rate limits.
-      const CHUNK_SIZE = 5;
+      // Run in chunks so we don't blow past App Builder / Vercel's 60s function
+      // timeout on large CSVs, but stay well under DPS rate limits. Caller can
+      // tune chunk_size (default 5, max 20). apiCall retries once on 429.
       const results = [], errors = [];
-      for (let i = 0; i < payloads.length; i += CHUNK_SIZE) {
-        const chunk = payloads.slice(i, i + CHUNK_SIZE);
+      for (let i = 0; i < payloads.length; i += chunk_size) {
+        const chunk = payloads.slice(i, i + chunk_size);
         const settled = await Promise.all(chunk.map(p =>
           apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items`, "POST", offerItemHeaders(token, cfg), p.payload)
             .then(res => ({ p, res }))
@@ -732,8 +750,12 @@ This will POST to /selection-strategies.`);
         dpsHeaders(token, cfg),
         {
           name, description,
+          // orderEvaluationType matrix (from Adobe DPS validation):
+          //   static           → use itemPriority
+          //   scoringFunction  → PQL-based ranking function; field name is `function` (not scoringFunction/rankingStrategy)
+          //   rankingStrategy  → AI-model ranking (Sensei) — not exposed by this tool yet
           rank: ranking_formula_id
-            ? { priority, order:{ orderEvaluationType:"rankingStrategy", rankingStrategy:ranking_formula_id } }
+            ? { priority, order:{ orderEvaluationType:"scoringFunction", function:ranking_formula_id } }
             : { priority, order:{ orderEvaluationType:"static" } },
           profileConstraint: eligibility_rule_id
             ? { profileConstraintType:"eligibilityRule", eligibilityRule:eligibility_rule_id }
