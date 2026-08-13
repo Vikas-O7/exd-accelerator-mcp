@@ -1,17 +1,16 @@
 // Vercel serverless route — POST /api/mcp speaks MCP Streamable HTTP.
 //
-// Each request is stateless: a fresh McpServer is built per call, configured from
-// the caller's HTTP headers (so each Adobe coworker can supply their own
-// CLIENT_ID / CLIENT_SECRET / sandbox / schema IDs).
+// Each request is stateless: a fresh McpServer is built per call, configured
+// from the caller's HTTP headers (so each user supplies their own credentials).
 //
 // To connect from an MCP client, set the server URL to:
 //    https://<your-vercel-app>.vercel.app/api/mcp
 // and add these headers (in the client's MCP config, NOT in the chat):
-//    x-adobe-client-id:      <Adobe Developer Console: Client ID>
-//    x-adobe-client-secret:  <Adobe Developer Console: Client Secret>
+//    x-adobe-client-id:      <OAuth Server-to-Server Client ID>
+//    x-adobe-client-secret:  <OAuth Server-to-Server Client Secret>
 //    x-adobe-org-id:         <your IMS Org ID>@AdobeOrg
-//    x-adobe-sandbox:        <sandbox name>
-//    x-adobe-tenant-id:      <your tenant id, e.g. acssandboxgdcthree>
+//    x-adobe-sandbox:        <development sandbox name>
+//    x-adobe-tenant-id:      <your tenant id, e.g. mytenant>
 //    x-adobe-schema-uri:     <full decisioning schema $id URI>
 //    x-adobe-schema-alt-id:  <decisioning schema meta:altId>
 //    x-adobe-catalog-id:     xcore:decision-catalog:xxxxxxxxxxxxxxxx

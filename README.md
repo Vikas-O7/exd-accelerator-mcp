@@ -4,21 +4,24 @@
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg)](.nvmrc)
 
-> ### ⚠️ Unofficial project — not an Adobe product
+> ### ⚠️ Unofficial community side project — not an Adobe product
 >
-> This is a **personal open-source project** built and maintained by
+> This is a **personal side project** by
 > [Khushi Nayal](https://github.com/khushi-nayal) and
-> [Vikas Ohlan](https://github.com/Vikas-O7). It is **not affiliated with,
-> endorsed by, or supported by Adobe Inc.** in any capacity.
+> [Vikas Ohlan](https://github.com/Vikas-O7), built for personal exploration
+> and community sharing. It is **not affiliated with, endorsed by, produced by,
+> or supported by Adobe Inc.** in any capacity, and does not represent any
+> employer's views or products.
 >
-> The project simply calls Adobe Experience Platform's *public* Schema Registry
-> and Decisioning APIs on behalf of a user who already has valid credentials for
+> The project calls Adobe Experience Platform's *public* Schema Registry and
+> Decisioning APIs on behalf of a user who already holds valid credentials for
 > those APIs. Adobe, Adobe Experience Platform, Adobe Journey Optimizer, and
 > Adobe Experience Decisioning are trademarks of Adobe Inc.; their names appear
-> here only to describe which APIs this project talks to.
+> here only to describe which public APIs this software calls.
 >
-> **You use this software at your own risk.** No warranty, no support SLA, and
-> no guarantee of compatibility with any future Adobe API changes.
+> **Intended for development sandboxes only. Do not use against production
+> sandboxes.** No warranty, no support SLA, no uptime commitments. Use at your
+> own risk under the Apache 2.0 license.
 
 ---
 
@@ -50,8 +53,8 @@ this project doesn't provision anything for you.
    [Adobe Developer Console](https://developer.adobe.com/console), attached to
    a product profile that grants Experience Platform access for your target
    sandbox. You'll need the resulting `CLIENT_ID` and `CLIENT_SECRET`.
-3. **Node.js ≥ 18** (for local runs) — or a Vercel / Adobe I/O Runtime account
-   if you want to host the server yourself.
+3. **Node.js ≥ 18** (for local runs) — or a Vercel account if you want to host
+   the server yourself.
 4. **An MCP-compatible client** — the reference is
    [Claude Desktop](https://claude.ai/download); Claude Code and any other
    client that speaks the MCP protocol will also work.
@@ -124,31 +127,19 @@ live.
 ## Hosting it yourself (HTTP)
 
 If you want a shared endpoint your team can point their MCP clients at, deploy
-the same codebase as an HTTP server. Two supported targets:
-
-### Option A — Vercel (simplest)
+the same codebase as an HTTP server on Vercel:
 
 1. Fork or clone this repo into your own GitHub account.
 2. Import it in [vercel.com/new](https://vercel.com/new). Framework preset:
    **Other**.
 3. Deploy — Vercel auto-detects `api/mcp.js` as the serverless route.
-4. **Do not** put Adobe credentials in Vercel's environment variables. Each
-   user of the endpoint supplies their own credentials via HTTP headers on
-   the MCP connection (see below).
+4. **Do not** put credentials in Vercel's environment variables. Each user of
+   the endpoint supplies their own credentials via HTTP headers on the MCP
+   connection (see below).
 
-### Option B — Adobe I/O Runtime (App Builder)
-
-If you have Adobe App Builder access, `actions/mcp/index.js` and
-`app.config.yaml` are ready to go. From a checkout with `@adobe/aio-cli`
-installed and logged into your workspace:
-
-```bash
-aio app deploy
-```
-
-The action is configured with `require-adobe-auth: false` so each MCP client
-call carries the user's own AEP credentials — same header-based model as the
-Vercel deployment.
+For a truly no-cost setup, use Vercel Hobby and remove any payment method in
+your account billing settings — the endpoint will pause if it exceeds free-tier
+limits rather than incurring charges.
 
 ### Header-based multi-tenant credentials
 
@@ -368,11 +359,8 @@ exd-accelerator-mcp/
 │   └── http-local.js     ← local HTTP server for testing the hosted route
 ├── api/
 │   └── mcp.js            ← Vercel serverless route (Streamable HTTP)
-├── actions/mcp/
-│   └── index.js          ← Adobe I/O Runtime action (App Builder)
 ├── scripts/
 │   └── smoke.js          ← 29-check smoke test for stdio + HTTP
-├── app.config.yaml       ← App Builder deployment config
 ├── vercel.json           ← Vercel deployment config
 ├── package.json
 ├── .env.example
@@ -427,8 +415,13 @@ run (`npm run smoke`) with your change.
 Copyright © 2026 **Khushi Nayal** and **Vikas Ohlan**. Released under the
 [Apache License 2.0](LICENSE).
 
-This project is developed independently. It is **not an Adobe product** and
+This is a **personal side project** developed independently. It is **not an
+Adobe product**, does not represent the views or work of any employer, and
 carries no support relationship with Adobe Inc. Adobe, Adobe Experience
 Platform, Adobe Journey Optimizer, and Adobe Experience Decisioning are
 trademarks of Adobe Inc.; they appear in this documentation only to describe
 which public APIs the software calls on the user's behalf.
+
+**Intended for development sandbox exploration only.** Not for production use.
+Apache 2.0's warranty disclaimer applies: the software is provided "AS IS"
+without any warranty, express or implied.
