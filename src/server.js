@@ -43,6 +43,11 @@ export const HEADER_MAP = Object.freeze({
   ITEM_CATALOG_ID:           "x-adobe-catalog-id",
   OOB_OFFER_CLASS:           "x-adobe-offer-class",
   ACCESS_TOKEN:              "x-adobe-access-token",
+  // Optional — when set, create_eligibility_rule and update_eligibility_rule
+  // will bake this into the segmentModel so AJO doesn't prompt for a merge
+  // policy each time. Not in the required-config set; missing = user gets
+  // prompted in the AJO UI when they open the rule.
+  MERGE_POLICY_ID:           "x-adobe-merge-policy-id",
 });
 
 const DEFAULTS = {
@@ -115,6 +120,18 @@ export async function mintToken(config) {
 
 export function clearTokenCache() { tokenCache.clear(); }
 
+// Invalidate the specific cache entry whose token value matches. Called from
+// apiCall when Adobe returns 401, so the very next mintToken() call re-mints
+// fresh rather than serving the same rejected token from cache. Without this,
+// a token revoked mid-TTL poisons every subsequent call until the natural
+// expiresAt eventually ages it out.
+export function clearTokenCacheByToken(token) {
+  if (!token) return;
+  for (const [k, v] of tokenCache) {
+    if (v.token === token) tokenCache.delete(k);
+  }
+}
+
 // ─── HEADERS ──────────────────────────────────────────────────────────────────
 function offerItemHeaders(token, config) {
   return {
@@ -176,20 +193,48 @@ function schemaHeaders(token, config, accept) {
 //
 // We do up to 2 retries for 409/429 (with exponential backoff) and 1 retry for
 // 5xx. Anything still failing after that surfaces to the caller.
+// 25s per-request abort ceiling. The 45s bulk soft-deadline only checks between
+// chunks — a single in-flight request that hangs (e.g., Adobe backend stall)
+// would otherwise wedge the Runtime container until its 60s hard kill. Setting
+// this well below 45s means at most one request is in the timeout danger zone
+// when a chunk starts, so a stalled call surfaces as a clean network_error
+// instead of a container-kill "connection lost".
+const REQUEST_TIMEOUT_MS = 25_000;
+
 async function apiCall(url, method, headers, body, { retry = true } = {}) {
   const opts = { method, headers };
   if (body !== undefined) opts.body = JSON.stringify(body);
 
   async function attempt() {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const res = await fetch(url, opts);
+      const res = await fetch(url, { ...opts, signal: ctl.signal });
       const text = await res.text();
       let json;
       try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
       const retryAfter = res.headers.get("retry-after");
+      // If Adobe rejected our token, evict it from the cache immediately so the
+      // NEXT mintToken() re-mints fresh. Without this, a token that gets
+      // revoked mid-TTL keeps poisoning every subsequent call until natural
+      // expiry hours later.
+      if (res.status === 401) {
+        const auth = (opts.headers?.Authorization || opts.headers?.authorization || "").replace(/^Bearer\s+/i, "");
+        if (auth) clearTokenCacheByToken(auth);
+      }
       return { status: res.status, ok: res.ok, body: json, retryAfter };
     } catch (e) {
-      return { status: 0, ok: false, body: { error: "network_error", message: e.message } };
+      const timedOut = e.name === "AbortError";
+      return {
+        status: 0,
+        ok: false,
+        body: {
+          error:   timedOut ? "request_timeout" : "network_error",
+          message: timedOut ? `Adobe backend did not respond within ${REQUEST_TIMEOUT_MS/1000}s` : e.message,
+        },
+      };
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -218,6 +263,52 @@ async function apiCall(url, method, headers, body, { retry = true } = {}) {
 
 function extractItems(body) {
   return body.results || body.items || body._embedded?.items || body.data || [];
+}
+
+// Scan every selection_strategy in the sandbox and return the ones whose
+// serialized JSON mentions `resourceId`. Selection strategies are the "hub"
+// resource that reference collections, ranking formulas, eligibility rules,
+// and placements — so this one scan powers the dependency preview for four
+// of the delete_* tools. Bounded to 20 pages × 100 = 2000 strategies (plenty
+// for real tenants; anything beyond is rare and the caller can still delete
+// with an explicit confirmed:true if they want to override).
+async function findSelectionStrategyReferences(resourceId, token, cfg) {
+  if (!resourceId) return { refs: [], truncated: false, error: null };
+  const PAGE_SIZE = 100, MAX_PAGES = 20;
+  const refs = [];
+  let url = `${DEFAULTS.BASE_DPS_URL}/selection-strategies?limit=${PAGE_SIZE}`;
+  let truncated = false;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await apiCall(url, "GET", dpsHeaders(token, cfg));
+    if (!res.ok) return { refs, truncated, error: `(${res.status}): ${JSON.stringify(res.body).slice(0, 200)}` };
+    const items = extractItems(res.body);
+    for (const s of items) {
+      // A substring search on the stringified strategy catches every field
+      // where the ID could appear (rank.order.function, optionSelection,
+      // eligibility, placement, etc.) without needing per-schema knowledge.
+      if (JSON.stringify(s).includes(resourceId)) {
+        refs.push({ id: s.id, name: s.name || "(unnamed)" });
+      }
+    }
+    const next = res.body._links?.next?.href;
+    if (!next || items.length === 0) break;
+    if (page === MAX_PAGES - 1) truncated = true;
+    url = next.startsWith("http") ? next : `${DEFAULTS.BASE_DPS_URL}${next}`;
+  }
+  return { refs, truncated, error: null };
+}
+
+// Compact preview line for delete_* confirmations. Renders "no references
+// found" when the list is empty (useful info — tells the user it's safe),
+// or the first few referring items when non-empty.
+function formatDependencyPreview(resourceLabel, refs, truncated, error) {
+  if (error) return `⚠️  Could not check for dependencies: ${error}`;
+  if (!refs.length) return `✅ No selection strategies reference this ${resourceLabel} (safe to delete).`;
+  const shown = refs.slice(0, 5);
+  return `⚠️  ${refs.length} selection strategy(ies) reference this ${resourceLabel}${truncated ? " (search truncated at 2000 strategies)" : ""}:
+${shown.map(r => `     • ${r.name}  (${r.id})`).join("\n")}${refs.length > 5 ? `\n     ... (${refs.length - 5} more)` : ""}
+
+   Deleting this ${resourceLabel} will BREAK those strategies. Consider updating them first.`;
 }
 
 // Runs `fn(item)` over `items` in concurrency-limited chunks — avoids blowing
@@ -1072,6 +1163,15 @@ ${preview}
 
 function parseCSV(csvText) {
   const result = Papa.parse(String(csvText || "").trim(), { header: true, skipEmptyLines: true, dynamicTyping: false });
+  // Papa never throws on bad CSV — it collects errors on .errors and returns
+  // whatever partial rows it managed to reconstruct. Surface those errors so
+  // the caller can't silently create offers from garbage rows (e.g. a stray
+  // quote that turns "name,priority,category" into one merged column).
+  const fatal = (result.errors || []).filter(e => e.type === "Delimiter" || e.type === "Quotes" || e.code === "MissingQuotes" || e.code === "UndetectableDelimiter");
+  if (fatal.length) {
+    const preview = fatal.slice(0, 3).map(e => `  • row ${e.row ?? "?"}: ${e.message}`).join("\n");
+    throw new Error(`Malformed CSV — ${fatal.length} parse error(s):\n${preview}${fatal.length > 3 ? `\n  ... (${fatal.length - 3} more)` : ""}`);
+  }
   return { columns: result.meta.fields || [], rows: result.data };
 }
 
@@ -1351,9 +1451,9 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
       lifecycle_status: z.enum(["draft","live","archived"]).default("draft"),
       dry_run:          boolish().describe("Returns full JSON payloads without calling the API. eligibility_rule/audience columns are shown unresolved (no lookups performed) since dry_run never makes API calls."),
       confirmed:        boolish().describe("Set to true to execute the write. Leave false to preview."),
-      chunk_size:       z.number().int().min(1).max(20).default(10).describe("How many offers to POST in parallel per chunk. Default 10, max 20. Larger = faster on big CSVs but risks 429 rate-limits on Adobe DPS (which the retry loop handles)."),
+      chunk_size:       z.number().int().min(1).max(20).default(5).describe("How many offers to POST in parallel per chunk. Default 5. Larger = faster on big CSVs but risks 429 rate-limits and pushes into Adobe's 60s function cap when the sandbox has heavy XDM schema validation."),
       offset:           z.number().int().min(0).default(0).describe("Skip this many CSV rows before processing. Use for pagination on big CSVs."),
-      limit:            z.number().int().min(1).max(200).default(50).describe("Process at most this many rows in this call. Default 50 (safely fits Adobe's 60s function cap). Set higher only if you know your CSV is small."),
+      limit:            z.number().int().min(1).max(200).default(25).describe("Process at most this many rows in this call. Default 25 — chosen so the soft 45s deadline finishes well below Adobe's 60s function cap even when the sandbox schema forces per-item validation. Set higher only if you know your CSV is small and validation is cheap."),
       access_token:     z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
     wrap(async ({ csv_text, json_text, lifecycle_status, dry_run, confirmed, chunk_size, offset, limit, access_token }) => {
@@ -1366,6 +1466,8 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
         : await requireApiConfig({ access_token });
 
       const { columns, rows: allRows } = csv_text ? parseCSV(csv_text) : parseJSONRows(json_text);
+      if (!allRows.length)
+        throw new Error(`Empty payload — ${csv_text ? "csv_text" : "json_text"} contained no rows. Provide at least one offer.`);
       const totalRows = allRows.length;
       const startIdx  = Math.min(offset, totalRows);
       const endIdx    = Math.min(offset + limit, totalRows);
@@ -1510,7 +1612,10 @@ This will POST ${payloads.length} requests to /offer-items.${endIdx < totalRows 
       // Run in chunks; enforce a soft deadline (55s) so we return partial
       // results gracefully instead of getting killed at Runtime's 60s cap.
       // 409 catalog write-lock conflicts are auto-retried by apiCall.
-      const SOFT_DEADLINE_MS = 55_000;
+      // 15s buffer below Runtime's 60s hard cap: leaves room for the current
+      // chunk's in-flight POSTs (each can take ~10s under heavy XDM validation
+      // + 409 catalog-conflict jittered retries) to finish before container kill.
+      const SOFT_DEADLINE_MS = 45_000;
       const t0 = Date.now();
       const results = [], errors = [];
       let stopped = false;
@@ -2304,17 +2409,29 @@ ${debugBlock}
 
   // ════════ TOOL 18 — list_schema_fieldgroups ══════════════════════════════════
   server.tool("list_schema_fieldgroups",
-    "List all tenant fieldgroups compatible with the Offer Item class. Read-only.",
+    "List all tenant fieldgroups compatible with the Offer Item class. Read-only. Schema Registry uses cursor pagination — pass `cursor` from a previous response to advance. Tenants with more than ~50 fieldgroups will need to chain calls.",
     {
       include_global: boolish(),
+      limit:          z.number().int().min(1).max(500).default(100).describe("Page size. Default 100, max 500."),
+      cursor:         z.string().optional().describe("Opaque next-page token from a previous response's tenantNextCursor. Applies to the tenant list only."),
       access_token:   z.string().optional(),
     },
-    wrap(async ({ include_global, access_token }) => {
+    wrap(async ({ include_global, limit, cursor, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const filter   = `property=meta:intendedToExtend==${encodeURIComponent(cfg.OOB_OFFER_CLASS)}`;
-      const tenantRes = await apiCall(`${DEFAULTS.BASE_SCHEMA_URL}/tenant/fieldgroups?${filter}&orderby=title`, "GET", schemaHeaders(token, cfg, "application/vnd.adobe.xed-id+json"));
+      const filter    = `property=meta:intendedToExtend==${encodeURIComponent(cfg.OOB_OFFER_CLASS)}`;
+      // Schema Registry pagination uses ?start=<orderby-value>. When we get a
+      // cursor back, it's either a full URL (DPS-style, unusual here) or the
+      // scalar "start" value from _page.next. Build the right URL for either.
+      const tenantUrl = cursor
+        ? (cursor.startsWith("http")
+            ? cursor
+            : cursor.startsWith("/")
+              ? `${DEFAULTS.BASE_SCHEMA_URL}${cursor}`
+              : `${DEFAULTS.BASE_SCHEMA_URL}/tenant/fieldgroups?${filter}&orderby=title&limit=${limit}&start=${encodeURIComponent(cursor)}`)
+        : `${DEFAULTS.BASE_SCHEMA_URL}/tenant/fieldgroups?${filter}&orderby=title&limit=${limit}`;
+      const tenantRes = await apiCall(tenantUrl, "GET", schemaHeaders(token, cfg, "application/vnd.adobe.xed-id+json"));
       const globalRes = include_global
-        ? await apiCall(`${DEFAULTS.BASE_SCHEMA_URL}/global/fieldgroups?${filter}&orderby=title`, "GET", schemaHeaders(token, cfg, "application/vnd.adobe.xed-id+json"))
+        ? await apiCall(`${DEFAULTS.BASE_SCHEMA_URL}/global/fieldgroups?${filter}&orderby=title&limit=${limit}`, "GET", schemaHeaders(token, cfg, "application/vnd.adobe.xed-id+json"))
         : null;
 
       if (!tenantRes.ok)
@@ -2322,6 +2439,12 @@ ${debugBlock}
 
       const tenantItems = extractItems(tenantRes.body);
       const globalItems = globalRes?.ok ? extractItems(globalRes.body) : [];
+      // Schema Registry returns _page.next as the next "start" value (a scalar
+      // matching the orderby field, e.g. a title string). Pass it back and
+      // we'll wrap it into ?start= on the next call.
+      const tenantNextHref = tenantRes.body._links?.next?.href
+        || tenantRes.body._page?.next?.href
+        || tenantRes.body._page?.next;
       const fmt = items => items.map(fg =>
         `  • ${fg.title || "untitled"}\n    altId  : ${fg["meta:altId"]||"?"}\n    $id    : ${fg["$id"]||"?"}\n    version: ${fg.version||"?"}`
       ).join("\n\n");
@@ -2332,8 +2455,9 @@ ${debugBlock}
 Class   : ${cfg.OOB_OFFER_CLASS}
 Sandbox : ${cfg.SANDBOX_NAME}
 
-🏢 YOUR TENANT FIELDGROUPS (${tenantItems.length}):
+🏢 YOUR TENANT FIELDGROUPS (${tenantItems.length} on this page):
 ${tenantItems.length ? fmt(tenantItems) : "  (none — no custom fieldgroups created yet)"}
+${tenantNextHref ? `\n⏭️  More tenant fieldgroups. Call list_schema_fieldgroups again with:\n     cursor: "${tenantNextHref}"` : ""}
 
 ${include_global ? `🌐 ADOBE GLOBAL FIELDGROUPS (${globalItems.length}):\n${globalItems.length ? fmt(globalItems) : "  (none)"}` : "💡 Pass include_global: true to also see Adobe OOB fieldgroups."}
 
@@ -2697,7 +2821,8 @@ This will PATCH /offer-rules/${resolvedId}.`);
   server.tool("update_ranking_formula",
     "Update an existing ranking formula using JSON Patch operations. If /expression changes, also regenerates uiModel to match, so the formula stays correctly rendered in AJO's visual Ranking Builder. Requires confirmed: true to execute.",
     {
-      formula_id: z.string().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx"),
+      ranking_formula_id: z.string().optional().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx"),
+      formula_id:         z.string().optional().describe("Legacy alias for ranking_formula_id. Prefer ranking_formula_id."),
       patches: z.array(z.object({
         op:    z.enum(["replace","add","remove"]),
         path:  z.string(),
@@ -2706,7 +2831,9 @@ This will PATCH /offer-rules/${resolvedId}.`);
       confirmed:    boolish(),
       access_token: z.string().optional(),
     },
-    wrap(async ({ formula_id, patches, confirmed, access_token }) => {
+    wrap(async ({ ranking_formula_id, formula_id: formula_id_legacy, patches, confirmed, access_token }) => {
+      const formula_id = ranking_formula_id || formula_id_legacy;
+      if (!formula_id) return { content: [{ type: "text", text: "❌ Provide ranking_formula_id (ID or exact name)." }] };
       const { cfg, token } = await requireApiConfig({ access_token });
 
       const resolve = await resolveRankingFormulaIdentifier(formula_id, token, cfg);
@@ -2783,7 +2910,8 @@ This will PATCH /ranking-formulas/${resolvedId}.`);
   server.tool("update_selection_strategy",
     "Update an existing selection strategy using JSON Patch operations. Requires confirmed: true to execute.",
     {
-      strategy_id: z.string().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx"),
+      selection_strategy_id: z.string().optional().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx"),
+      strategy_id:           z.string().optional().describe("Legacy alias for selection_strategy_id. Prefer selection_strategy_id."),
       patches: z.array(z.object({
         op:    z.enum(["replace","add","remove"]),
         path:  z.string(),
@@ -2792,7 +2920,9 @@ This will PATCH /ranking-formulas/${resolvedId}.`);
       confirmed:    boolish(),
       access_token: z.string().optional(),
     },
-    wrap(async ({ strategy_id, patches, confirmed, access_token }) => {
+    wrap(async ({ selection_strategy_id, strategy_id: strategy_id_legacy, patches, confirmed, access_token }) => {
+      const strategy_id = selection_strategy_id || strategy_id_legacy;
+      if (!strategy_id) return { content: [{ type: "text", text: "❌ Provide selection_strategy_id (ID or exact name)." }] };
       const { cfg, token } = await requireApiConfig({ access_token });
       const resolve = await resolveSelectionStrategyIdentifier(strategy_id, token, cfg);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
@@ -2959,14 +3089,20 @@ ${nextHref ? `\n⏭️  More pages available. Call list_collections again with:\
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       const resolvedId = resolve.id;
 
+      // Only scan for dependencies on the FIRST call (no confirmed) so the
+      // second-call fast path doesn't repeat the ~1-2s scan.
+      let depPreview = "";
+      if (!confirmed) {
+        const { refs, truncated, error } = await findSelectionStrategyReferences(resolvedId, token, cfg);
+        depPreview = "\n" + formatDependencyPreview("collection", refs, truncated, error) + "\n";
+      }
+
       const check = await needsConfirmation(server, confirmed,
 `COLLECTION TO DELETE:
   Collection ID : ${resolvedId}${collection_id !== resolvedId ? ` (resolved from "${collection_id}")` : ""}
   Sandbox       : ${cfg.SANDBOX_NAME}
-
-⚠️  This cannot be undone. Any selection strategy referencing this collection will break.
-
-This will DELETE /item-collections/${resolvedId}.`);
+${depPreview}
+This will DELETE /item-collections/${resolvedId}. This cannot be undone.`);
       if (check) return check;
 
       const res = await apiCall(
@@ -3046,14 +3182,18 @@ ${nextHref ? `\n⏭️  More pages available. Call list_eligibility_rules again 
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       const resolvedId = resolve.id;
 
+      let depPreview = "";
+      if (!confirmed) {
+        const { refs, truncated, error } = await findSelectionStrategyReferences(resolvedId, token, cfg);
+        depPreview = "\n" + formatDependencyPreview("eligibility rule", refs, truncated, error) + "\n";
+      }
+
       const check = await needsConfirmation(server, confirmed,
 `ELIGIBILITY RULE TO DELETE:
   Rule ID : ${resolvedId}${rule_id !== resolvedId ? ` (resolved from "${rule_id}")` : ""}
   Sandbox : ${cfg.SANDBOX_NAME}
-
-⚠️  This cannot be undone. Any selection strategy referencing this rule will break.
-
-This will DELETE /offer-rules/${resolvedId}.`);
+${depPreview}
+This will DELETE /offer-rules/${resolvedId}. This cannot be undone.`);
       if (check) return check;
 
       const res = await apiCall(
@@ -3070,12 +3210,15 @@ This will DELETE /offer-rules/${resolvedId}.`);
   server.tool("get_ranking_formula",
     "Look up a single ranking formula by its DPS ID or exact formula name. Read-only.",
     {
-      formula_id:   z.string().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx. A name matching more than one formula fails with an error listing the matches."),
-      access_token: z.string().optional(),
+      ranking_formula_id: z.string().optional().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx. A name matching more than one formula fails with an error listing the matches."),
+      formula_id:         z.string().optional().describe("Legacy alias for ranking_formula_id. Prefer ranking_formula_id."),
+      access_token:       z.string().optional(),
     },
-    wrap(async ({ formula_id, access_token }) => {
+    wrap(async ({ ranking_formula_id, formula_id, access_token }) => {
+      const id = ranking_formula_id || formula_id;
+      if (!id) return { content: [{ type: "text", text: "❌ Provide ranking_formula_id (ID or exact name)." }] };
       const { cfg, token } = await requireApiConfig({ access_token });
-      const resolve = await resolveRankingFormulaIdentifier(formula_id, token, cfg);
+      const resolve = await resolveRankingFormulaIdentifier(id, token, cfg);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
       const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/ranking-formulas/${resolve.id}`, "GET", dpsHeaders(token, cfg));
@@ -3123,24 +3266,31 @@ ${nextHref ? `\n⏭️  More pages available. Call list_ranking_formulas again w
   server.tool("delete_ranking_formula",
     "Permanently delete a ranking formula. Requires confirmed: true to execute. This cannot be undone — any selection strategy still referencing this formula will break.",
     {
-      formula_id:   z.string().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx"),
-      confirmed:    boolish(),
-      access_token: z.string().optional(),
+      ranking_formula_id: z.string().optional().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx"),
+      formula_id:         z.string().optional().describe("Legacy alias for ranking_formula_id. Prefer ranking_formula_id."),
+      confirmed:          boolish(),
+      access_token:       z.string().optional(),
     },
-    wrap(async ({ formula_id, confirmed, access_token }) => {
+    wrap(async ({ ranking_formula_id, formula_id, confirmed, access_token }) => {
+      const inputId = ranking_formula_id || formula_id;
+      if (!inputId) return { content: [{ type: "text", text: "❌ Provide ranking_formula_id (ID or exact name)." }] };
       const { cfg, token } = await requireApiConfig({ access_token });
-      const resolve = await resolveRankingFormulaIdentifier(formula_id, token, cfg);
+      const resolve = await resolveRankingFormulaIdentifier(inputId, token, cfg);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       const resolvedId = resolve.id;
 
+      let depPreview = "";
+      if (!confirmed) {
+        const { refs, truncated, error } = await findSelectionStrategyReferences(resolvedId, token, cfg);
+        depPreview = "\n" + formatDependencyPreview("ranking formula", refs, truncated, error) + "\n";
+      }
+
       const check = await needsConfirmation(server, confirmed,
 `RANKING FORMULA TO DELETE:
-  Formula ID : ${resolvedId}${formula_id !== resolvedId ? ` (resolved from "${formula_id}")` : ""}
+  Formula ID : ${resolvedId}${inputId !== resolvedId ? ` (resolved from "${inputId}")` : ""}
   Sandbox    : ${cfg.SANDBOX_NAME}
-
-⚠️  This cannot be undone. Any selection strategy referencing this formula will break.
-
-This will DELETE /ranking-formulas/${resolvedId}.`);
+${depPreview}
+This will DELETE /ranking-formulas/${resolvedId}. This cannot be undone.`);
       if (check) return check;
 
       const res = await apiCall(
@@ -3157,12 +3307,15 @@ This will DELETE /ranking-formulas/${resolvedId}.`);
   server.tool("get_selection_strategy",
     "Look up a single selection strategy by its DPS ID or exact strategy name. Read-only.",
     {
-      strategy_id:  z.string().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx. A name matching more than one strategy fails with an error listing the matches."),
-      access_token: z.string().optional(),
+      selection_strategy_id: z.string().optional().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx. A name matching more than one strategy fails with an error listing the matches."),
+      strategy_id:           z.string().optional().describe("Legacy alias for selection_strategy_id. Prefer selection_strategy_id."),
+      access_token:          z.string().optional(),
     },
-    wrap(async ({ strategy_id, access_token }) => {
+    wrap(async ({ selection_strategy_id, strategy_id, access_token }) => {
+      const id = selection_strategy_id || strategy_id;
+      if (!id) return { content: [{ type: "text", text: "❌ Provide selection_strategy_id (ID or exact name)." }] };
       const { cfg, token } = await requireApiConfig({ access_token });
-      const resolve = await resolveSelectionStrategyIdentifier(strategy_id, token, cfg);
+      const resolve = await resolveSelectionStrategyIdentifier(id, token, cfg);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
       const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/selection-strategies/${resolve.id}`, "GET", dpsHeaders(token, cfg));
@@ -3210,19 +3363,22 @@ ${nextHref ? `\n⏭️  More pages available. Call list_selection_strategies aga
   server.tool("delete_selection_strategy",
     "Permanently delete a selection strategy. Requires confirmed: true to execute. This cannot be undone — any placement or journey still referencing this strategy will break.",
     {
-      strategy_id:  z.string().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx"),
-      confirmed:    boolish(),
-      access_token: z.string().optional(),
+      selection_strategy_id: z.string().optional().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx"),
+      strategy_id:           z.string().optional().describe("Legacy alias for selection_strategy_id. Prefer selection_strategy_id."),
+      confirmed:             boolish(),
+      access_token:          z.string().optional(),
     },
-    wrap(async ({ strategy_id, confirmed, access_token }) => {
+    wrap(async ({ selection_strategy_id, strategy_id, confirmed, access_token }) => {
+      const inputId = selection_strategy_id || strategy_id;
+      if (!inputId) return { content: [{ type: "text", text: "❌ Provide selection_strategy_id (ID or exact name)." }] };
       const { cfg, token } = await requireApiConfig({ access_token });
-      const resolve = await resolveSelectionStrategyIdentifier(strategy_id, token, cfg);
+      const resolve = await resolveSelectionStrategyIdentifier(inputId, token, cfg);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       const resolvedId = resolve.id;
 
       const check = await needsConfirmation(server, confirmed,
 `SELECTION STRATEGY TO DELETE:
-  Strategy ID : ${resolvedId}${strategy_id !== resolvedId ? ` (resolved from "${strategy_id}")` : ""}
+  Strategy ID : ${resolvedId}${inputId !== resolvedId ? ` (resolved from "${inputId}")` : ""}
   Sandbox     : ${cfg.SANDBOX_NAME}
 
 ⚠️  This cannot be undone. Any placement or journey referencing this strategy will break.
@@ -3253,6 +3409,76 @@ This will DELETE /selection-strategies/${resolvedId}.`);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
       const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/exd-placements/${resolve.id}`, "GET", placementHeaders(token, cfg));
+      return { content: [{ type: "text", text: res.ok
+        ? JSON.stringify(res.body, null, 2)
+        : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 40a — list_placements ═════════════════════════════════════════
+  server.tool("list_placements",
+    "List channel placements in this sandbox. Read-only. Placements are the surfaces that Selection Strategies deliver offers to (web slot, email block, push channel, etc.). Cursor-paginate via `_links.next.href` (pass the returned cursor back in on the next call).",
+    {
+      limit:        z.number().default(20),
+      cursor:       z.string().optional().describe("Opaque next-page token from a previous response. Omit for the first page."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ limit, cursor, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const url = cursor
+        ? (cursor.startsWith("http") ? cursor : `${DEFAULTS.BASE_DPS_URL}${cursor}`)
+        : `${DEFAULTS.BASE_DPS_URL}/exd-placements?limit=${limit}`;
+      const res = await apiCall(url, "GET", placementHeaders(token, cfg));
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+
+      const items = extractItems(res.body);
+      const nextHref = res.body._links?.next?.href;
+      if (!items.length)
+        return { content: [{ type: "text", text:
+`ℹ️ No placements found in ${cfg.SANDBOX_NAME}.
+Create one with create_placement before wiring a selection_strategy.` }] };
+
+      return { content: [{ type: "text", text:
+`📋 Placements (${items.length} on this page):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(p => `  • ${p.name || "unnamed"} | Channel: ${(p.channel||"").split("/").pop()||"?"} | Status: ${p.status||"-"} | ID: ${p.id||"?"}`).join("\n")}
+${nextHref ? `\n⏭️  More pages available. Call list_placements again with:\n     cursor: "${nextHref}"` : `\n✅ End of results — no more pages.`}` }] };
+    })
+  );
+
+  // ════════ TOOL 40b — list_audiences ══════════════════════════════════════════
+  server.tool("list_audiences",
+    "List RT-CDP audience segments available in this sandbox. Read-only. Use this before attach_offer_eligibility_rule or bulk_create_offers (audience column) so you know what audience names/IDs exist. Returns up to ~2000 audiences (pages internally).",
+    {
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const { items, error } = await fetchAllAudiences(token, cfg);
+      if (error) return { content: [{ type: "text", text: `❌ Failed to list audiences ${error}` }] };
+      if (!items.length)
+        return { content: [{ type: "text", text: `ℹ️ No RT-CDP audiences found in ${cfg.SANDBOX_NAME}.` }] };
+
+      return { content: [{ type: "text", text:
+`👥 RT-CDP Audiences (${items.length} total in ${cfg.SANDBOX_NAME}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(a => `  • ${a.name || "unnamed"} | Type: ${a.type || "-"} | ID: ${a.id || "?"}`).join("\n")}` }] };
+    })
+  );
+
+  // ════════ TOOL 40c — get_audience ═════════════════════════════════════════════
+  server.tool("get_audience",
+    "Look up a single RT-CDP audience by its segment ID or exact name. Read-only. Useful before creating an eligibility rule that wraps this audience.",
+    {
+      audience_id:  z.string().describe("Audience segment ID (UUID) or exact audience name. If a name matches more than one audience, the call fails with the list of matches."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ audience_id, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveAudienceIdentifier(audience_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const res = await apiCall(`${DEFAULTS.BASE_UPS_URL}/segment/definitions/${resolve.id}`, "GET", rtcdpHeaders(token, cfg));
       return { content: [{ type: "text", text: res.ok
         ? JSON.stringify(res.body, null, 2)
         : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
@@ -3307,14 +3533,18 @@ This will DELETE /offer-items/${resolvedId}.`);
       if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
       const resolvedId = resolve.id;
 
+      let depPreview = "";
+      if (!confirmed) {
+        const { refs, truncated, error } = await findSelectionStrategyReferences(resolvedId, token, cfg);
+        depPreview = "\n" + formatDependencyPreview("placement", refs, truncated, error) + "\n";
+      }
+
       const check = await needsConfirmation(server, confirmed,
 `PLACEMENT TO DELETE:
   Placement ID : ${resolvedId}${placement_id !== resolvedId ? ` (resolved from "${placement_id}")` : ""}
   Sandbox      : ${cfg.SANDBOX_NAME}
-
-⚠️  This cannot be undone. Any selection strategy wired to this placement will break.
-
-This will DELETE /exd-placements/${resolvedId}.`);
+${depPreview}
+This will DELETE /exd-placements/${resolvedId}. This cannot be undone.`);
       if (check) return check;
 
       const res = await apiCall(
@@ -3377,7 +3607,7 @@ ${resolvedUpdates.slice(0, 5).map((u, i) => `${startIdx + i + 1}. ${u.resolvedId
 This will PATCH ${resolvedUpdates.length} offer-items.${endIdx < totalUpdates ? `\n\n⚠️ You supplied ${totalUpdates} updates but only ${limit} will be processed this call. After confirming, you'll get a "call again with offset:${endIdx}" hint to continue.` : ""}`);
       if (check) return check;
 
-      const SOFT_DEADLINE_MS = 50_000;
+      const SOFT_DEADLINE_MS = 45_000;
       const t0 = Date.now();
       const results = [], errors = [];
       let stopped = false;
@@ -3450,7 +3680,7 @@ This will DELETE ${idsWindow.length} offer-items.`);
       // Soft deadline so we return partial results gracefully instead of being
       // killed at Runtime's 60s cap. 409 catalog-conflict retries can add ~2s
       // per failed request, so we budget conservatively.
-      const SOFT_DEADLINE_MS = 50_000;
+      const SOFT_DEADLINE_MS = 45_000;
       const t0 = Date.now();
       const results = [], errors = [];
       let stopped = false;
