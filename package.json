@@ -4,7 +4,11 @@
   "description": "ExD Accelerator — AI-native Experience Decisioning MCP server. Stdio for Claude Desktop, Streamable HTTP for Vercel.",
   "type": "module",
   "license": "Apache-2.0",
-  "author": "Vikas Ohlan",
+  "author": "Khushi Nayal",
+  "contributors": [
+    "Khushi Nayal",
+    "Vikas Ohlan"
+  ],
   "homepage": "https://github.com/Vikas-O7/exd-accelerator-mcp#readme",
   "repository": {
     "type": "git",

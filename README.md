@@ -7,6 +7,7 @@
 > ### ⚠️ Unofficial project — not an Adobe product
 >
 > This is a **personal open-source project** built and maintained by
+> [Khushi Nayal](https://github.com/khushi-nayal) and
 > [Vikas Ohlan](https://github.com/Vikas-O7). It is **not affiliated with,
 > endorsed by, or supported by Adobe Inc.** in any capacity.
 >
@@ -416,9 +417,14 @@ run (`npm run smoke`) with your change.
 
 ---
 
+## Maintainers
+
+- **[Khushi Nayal](https://github.com/khushi-nayal)**
+- **[Vikas Ohlan](https://github.com/Vikas-O7)**
+
 ## Ownership and license
 
-Copyright © 2026 **Vikas Ohlan**. Released under the
+Copyright © 2026 **Khushi Nayal** and **Vikas Ohlan**. Released under the
 [Apache License 2.0](LICENSE).
 
 This project is developed independently. It is **not an Adobe product** and
