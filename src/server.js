@@ -240,15 +240,23 @@ async function runChunked(items, fn, chunkSize = 5) {
 // Paginates through a DPS list endpoint (bounded — 20 pages of 100, plenty for
 // name-lookup purposes) and returns every item, for the name-resolution
 // helpers below.
+// Adobe DPS list endpoints use cursor pagination via _links.next, NOT offset.
+// The offset query param is silently ignored — passing offset=100 returns the
+// same first page as offset=0. Follow _links.next.href instead.
 async function fetchAllItems(urlBase, headers) {
-  const PAGE_SIZE = 100, MAX_PAGES = 20;
+  const PAGE_SIZE = 100, MAX_PAGES = 50; // 50 * 100 = 5,000 items ceiling
   const all = [];
+  let url = `${urlBase}&limit=${PAGE_SIZE}`;
   for (let page = 0; page < MAX_PAGES; page++) {
-    const res = await apiCall(`${urlBase}&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`, "GET", headers);
+    const res = await apiCall(url, "GET", headers);
     if (!res.ok) return { items: null, error: `(${res.status}): ${JSON.stringify(res.body)}` };
     const items = extractItems(res.body);
     all.push(...items);
-    if (items.length < PAGE_SIZE) break;
+    // Follow the cursor Adobe hands us in _links.next.href — it's a relative
+    // path from the DPS root (e.g. "/offer-items?...&start=...").
+    const nextHref = res.body._links?.next?.href;
+    if (!nextHref || items.length === 0) break;
+    url = nextHref.startsWith("http") ? nextHref : `${DEFAULTS.BASE_DPS_URL}${nextHref}`;
   }
   return { items: all, error: null };
 }
@@ -1810,22 +1818,24 @@ Status  : ${status}` }] };
 
   // ════════ TOOL 10 — list_offer_items ═════════════════════════════════════════
   server.tool("list_offer_items",
-    "List all offer items in the ExD catalog with pagination. Read-only.",
+    "List offer items in the ExD catalog. Read-only. Adobe DPS uses cursor pagination — pass `cursor` from the previous response to get the next page. `offset` is accepted only for backward compatibility and is silently ignored.",
     {
       limit:        z.number().default(20),
-      offset:       z.number().default(0),
+      cursor:       z.string().optional().describe("Opaque next-page token from a previous response (its Next cursor line). Omit for the first page."),
+      offset:       z.number().optional().describe("Deprecated: Adobe DPS ignores this. Use cursor instead."),
       access_token: z.string().optional(),
     },
-    wrap(async ({ limit, offset, access_token }) => {
+    wrap(async ({ limit, cursor, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const res = await apiCall(
-        `${DEFAULTS.BASE_DPS_URL}/offer-items?limit=${limit}&offset=${offset}`, "GET",
-        offerItemHeaders(token, cfg)
-      );
+      const url = cursor
+        ? (cursor.startsWith("http") ? cursor : `${DEFAULTS.BASE_DPS_URL}${cursor}`)
+        : `${DEFAULTS.BASE_DPS_URL}/offer-items?limit=${limit}`;
+      const res = await apiCall(url, "GET", offerItemHeaders(token, cfg));
       if (!res.ok)
         return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
 
       const items = extractItems(res.body);
+      const nextHref = res.body._links?.next?.href;
       if (!items.length)
         return { content: [{ type: "text", text:
 `⚠️ 0 items returned.
@@ -1833,14 +1843,14 @@ Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
 Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
 
       return { content: [{ type: "text", text:
-`📋 Offer items (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+`📋 Offer items (${items.length} on this page):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${items.map(i => {
   const d = i._experience?.decisioning?.decisionitem;
   const s = i._experience?.decisioning?.offeritem?.lifecycleStatus || "-";
   return `  • ${d?.itemName||"unnamed"} | Priority: ${d?.itemPriority??"-"} | Status: ${s} | ID: ${i.id||"?"}`;
 }).join("\n")}
-${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+${nextHref ? `\n⏭️  More pages available. Call list_offer_items again with:\n     cursor: "${nextHref}"` : `\n✅ End of results — no more pages.`}` }] };
     })
   );
 
@@ -2903,22 +2913,24 @@ ${nameMismatch ? `\n⚠️  Requested name "${payload.name}" was not persisted b
 
   // ════════ TOOL 28 — list_collections ═════════════════════════════════════════
   server.tool("list_collections",
-    "List all item collections in the sandbox with pagination. Read-only.",
+    "List item collections in the sandbox. Read-only. Uses cursor pagination — pass `cursor` from the previous response for the next page.",
     {
       limit:        z.number().default(20),
-      offset:       z.number().default(0),
+      cursor:       z.string().optional().describe("Opaque next-page token from a previous response. Omit for the first page."),
+      offset:       z.number().optional().describe("Deprecated: Adobe DPS ignores this. Use cursor instead."),
       access_token: z.string().optional(),
     },
-    wrap(async ({ limit, offset, access_token }) => {
+    wrap(async ({ limit, cursor, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const res = await apiCall(
-        `${DEFAULTS.BASE_DPS_URL}/item-collections?limit=${limit}&offset=${offset}`, "GET",
-        dpsHeaders(token, cfg)
-      );
+      const url = cursor
+        ? (cursor.startsWith("http") ? cursor : `${DEFAULTS.BASE_DPS_URL}${cursor}`)
+        : `${DEFAULTS.BASE_DPS_URL}/item-collections?limit=${limit}`;
+      const res = await apiCall(url, "GET", dpsHeaders(token, cfg));
       if (!res.ok)
         return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
 
       const items = extractItems(res.body);
+      const nextHref = res.body._links?.next?.href;
       if (!items.length)
         return { content: [{ type: "text", text:
 `⚠️ 0 items returned.
@@ -2926,10 +2938,10 @@ Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
 Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
 
       return { content: [{ type: "text", text:
-`📋 Collections (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+`📋 Collections (${items.length} on this page):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
-${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+${nextHref ? `\n⏭️  More pages available. Call list_collections again with:\n     cursor: "${nextHref}"` : `\n✅ End of results.`}` }] };
     })
   );
 
@@ -2988,22 +3000,24 @@ This will DELETE /item-collections/${resolvedId}.`);
 
   // ════════ TOOL 31 — list_eligibility_rules ═══════════════════════════════════
   server.tool("list_eligibility_rules",
-    "List all ExD eligibility rules in the sandbox with pagination. Read-only. Filters to exdRule==true so unrelated offer-rules aren't included.",
+    "List ExD eligibility rules in the sandbox. Read-only. Filters to exdRule==true. Uses cursor pagination — pass `cursor` from the previous response for the next page.",
     {
       limit:        z.number().default(20),
-      offset:       z.number().default(0),
+      cursor:       z.string().optional().describe("Opaque next-page token from a previous response. Omit for the first page."),
+      offset:       z.number().optional().describe("Deprecated: Adobe DPS ignores this. Use cursor instead."),
       access_token: z.string().optional(),
     },
-    wrap(async ({ limit, offset, access_token }) => {
+    wrap(async ({ limit, cursor, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const res = await apiCall(
-        `${DEFAULTS.BASE_DPS_URL}/offer-rules?property=exdRule%3D%3Dtrue&limit=${limit}&offset=${offset}`, "GET",
-        dpsHeaders(token, cfg)
-      );
+      const url = cursor
+        ? (cursor.startsWith("http") ? cursor : `${DEFAULTS.BASE_DPS_URL}${cursor}`)
+        : `${DEFAULTS.BASE_DPS_URL}/offer-rules?property=exdRule%3D%3Dtrue&limit=${limit}`;
+      const res = await apiCall(url, "GET", dpsHeaders(token, cfg));
       if (!res.ok)
         return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
 
       const items = extractItems(res.body);
+      const nextHref = res.body._links?.next?.href;
       if (!items.length)
         return { content: [{ type: "text", text:
 `⚠️ 0 items returned.
@@ -3011,10 +3025,10 @@ Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
 Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
 
       return { content: [{ type: "text", text:
-`📋 Eligibility rules (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+`📋 Eligibility rules (${items.length} on this page):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
-${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+${nextHref ? `\n⏭️  More pages available. Call list_eligibility_rules again with:\n     cursor: "${nextHref}"` : `\n✅ End of results.`}` }] };
     })
   );
 
@@ -3073,22 +3087,24 @@ This will DELETE /offer-rules/${resolvedId}.`);
 
   // ════════ TOOL 34 — list_ranking_formulas ════════════════════════════════════
   server.tool("list_ranking_formulas",
-    "List all ExD ranking formulas in the sandbox with pagination. Read-only. Filters to exdFunction==true so unrelated ranking-formulas aren't included.",
+    "List ExD ranking formulas in the sandbox. Read-only. Filters to exdFunction==true. Uses cursor pagination — pass `cursor` from the previous response for the next page.",
     {
       limit:        z.number().default(20),
-      offset:       z.number().default(0),
+      cursor:       z.string().optional().describe("Opaque next-page token from a previous response. Omit for the first page."),
+      offset:       z.number().optional().describe("Deprecated: Adobe DPS ignores this. Use cursor instead."),
       access_token: z.string().optional(),
     },
-    wrap(async ({ limit, offset, access_token }) => {
+    wrap(async ({ limit, cursor, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const res = await apiCall(
-        `${DEFAULTS.BASE_DPS_URL}/ranking-formulas?property=exdFunction%3D%3Dtrue&limit=${limit}&offset=${offset}`, "GET",
-        dpsHeaders(token, cfg)
-      );
+      const url = cursor
+        ? (cursor.startsWith("http") ? cursor : `${DEFAULTS.BASE_DPS_URL}${cursor}`)
+        : `${DEFAULTS.BASE_DPS_URL}/ranking-formulas?property=exdFunction%3D%3Dtrue&limit=${limit}`;
+      const res = await apiCall(url, "GET", dpsHeaders(token, cfg));
       if (!res.ok)
         return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
 
       const items = extractItems(res.body);
+      const nextHref = res.body._links?.next?.href;
       if (!items.length)
         return { content: [{ type: "text", text:
 `⚠️ 0 items returned.
@@ -3096,10 +3112,10 @@ Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
 Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
 
       return { content: [{ type: "text", text:
-`📋 Ranking formulas (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+`📋 Ranking formulas (${items.length} on this page):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
-${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+${nextHref ? `\n⏭️  More pages available. Call list_ranking_formulas again with:\n     cursor: "${nextHref}"` : `\n✅ End of results.`}` }] };
     })
   );
 
@@ -3158,22 +3174,24 @@ This will DELETE /ranking-formulas/${resolvedId}.`);
 
   // ════════ TOOL 37 — list_selection_strategies ════════════════════════════════
   server.tool("list_selection_strategies",
-    "List all selection strategies in the sandbox with pagination. Read-only.",
+    "List selection strategies in the sandbox. Read-only. Uses cursor pagination — pass `cursor` from the previous response for the next page.",
     {
       limit:        z.number().default(20),
-      offset:       z.number().default(0),
+      cursor:       z.string().optional().describe("Opaque next-page token from a previous response. Omit for the first page."),
+      offset:       z.number().optional().describe("Deprecated: Adobe DPS ignores this. Use cursor instead."),
       access_token: z.string().optional(),
     },
-    wrap(async ({ limit, offset, access_token }) => {
+    wrap(async ({ limit, cursor, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const res = await apiCall(
-        `${DEFAULTS.BASE_DPS_URL}/selection-strategies?limit=${limit}&offset=${offset}`, "GET",
-        dpsHeaders(token, cfg)
-      );
+      const url = cursor
+        ? (cursor.startsWith("http") ? cursor : `${DEFAULTS.BASE_DPS_URL}${cursor}`)
+        : `${DEFAULTS.BASE_DPS_URL}/selection-strategies?limit=${limit}`;
+      const res = await apiCall(url, "GET", dpsHeaders(token, cfg));
       if (!res.ok)
         return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
 
       const items = extractItems(res.body);
+      const nextHref = res.body._links?.next?.href;
       if (!items.length)
         return { content: [{ type: "text", text:
 `⚠️ 0 items returned.
@@ -3181,10 +3199,10 @@ Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
 Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
 
       return { content: [{ type: "text", text:
-`📋 Selection strategies (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+`📋 Selection strategies (${items.length} on this page):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
-${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+${nextHref ? `\n⏭️  More pages available. Call list_selection_strategies again with:\n     cursor: "${nextHref}"` : `\n✅ End of results.`}` }] };
     })
   );
 
@@ -3311,7 +3329,7 @@ This will DELETE /exd-placements/${resolvedId}.`);
 
   // ════════ TOOL 42 — bulk_update_offers ═══════════════════════════════════════
   server.tool("bulk_update_offers",
-    "Update multiple existing offer items in one call, each with its own JSON Patch operations. Requires confirmed: true to execute — previews all patches first. Use dry_run: true to inspect the patch payloads without calling the API.",
+    "Update multiple existing offer items in one call, each with its own JSON Patch operations. Requires confirmed: true. Supports pagination via offset/limit: each call processes at most 30 updates to stay under Adobe I/O Runtime's 60s cap, then returns a 'call again with offset:X' instruction the LLM chains automatically.",
     {
       updates: z.array(z.object({
         offer_id: z.string().describe("Offer item ID or exact offer name"),
@@ -3323,84 +3341,147 @@ This will DELETE /exd-placements/${resolvedId}.`);
       })).min(1).describe("One entry per offer to update"),
       dry_run:      boolish().describe("Returns the patch payloads without calling the API. Names are shown unresolved since dry_run never makes API calls."),
       confirmed:    boolish().describe("Set to true to execute the write. Leave false to preview."),
+      offset:       z.number().int().min(0).default(0).describe("Skip this many updates before processing. Use for pagination on big batches."),
+      limit:        z.number().int().min(1).max(60).default(30).describe("Process at most this many updates in this call. Default 30 (safely fits Adobe's 60s function cap)."),
+      chunk_size:   z.number().int().min(1).max(10).default(5).describe("How many PATCHes to issue in parallel per chunk. Default 5."),
       access_token: z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
-    wrap(async ({ updates, dry_run, confirmed, access_token }) => {
+    wrap(async ({ updates, dry_run, confirmed, offset, limit, chunk_size, access_token }) => {
+      const totalUpdates = updates.length;
+      const startIdx     = Math.min(offset, totalUpdates);
+      const endIdx       = Math.min(offset + limit, totalUpdates);
+      const window       = updates.slice(startIdx, endIdx);
+      const windowLabel  = `updates ${startIdx + 1}-${endIdx} of ${totalUpdates}`;
+
       const fmtUpdate = (u, i) =>
-        `${i + 1}. ${u.offer_id}\n${u.patches.map(p => `   ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}`;
+        `${startIdx + i + 1}. ${u.offer_id}\n${u.patches.map(p => `   ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}`;
 
       if (dry_run) return { content: [{ type: "text", text:
-`🔍 DRY RUN — ${updates.length} offer(s) would be updated:
-${updates.map(fmtUpdate).join("\n\n")}
+`🔍 DRY RUN — ${window.length} offer(s) would be updated (window: ${windowLabel}):
+${window.slice(0, 10).map(fmtUpdate).join("\n\n")}${window.length > 10 ? `\n... (${window.length - 10} more not shown)` : ""}
 
 Call again with dry_run: false and confirmed: true to execute.` }] };
 
       const { cfg, token } = await requireApiConfig({ access_token });
 
-      const offerResolve = await resolveOfferIdentifiers(updates.map(u => u.offer_id), token, cfg);
+      const offerResolve = await resolveOfferIdentifiers(window.map(u => u.offer_id), token, cfg);
       if (offerResolve.error) return { content: [{ type: "text", text: `❌ Could not resolve offer_id(s): ${offerResolve.error}` }] };
-      const resolvedUpdates = updates.map((u, i) => ({ ...u, resolvedId: offerResolve.ids[i] }));
-      const fmtResolved = (u, i) =>
-        `${i + 1}. ${u.resolvedId}${u.offer_id !== u.resolvedId ? ` (resolved from "${u.offer_id}")` : ""}\n${u.patches.map(p => `   ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}`;
+      const resolvedUpdates = window.map((u, i) => ({ ...u, resolvedId: offerResolve.ids[i] }));
 
       const check = await needsConfirmation(server, confirmed,
-`OFFERS TO UPDATE: ${resolvedUpdates.length}
+`OFFERS TO UPDATE: ${resolvedUpdates.length} (window: ${windowLabel})
 Sandbox : ${cfg.SANDBOX_NAME}
 
-${resolvedUpdates.map(fmtResolved).join("\n\n")}
+${resolvedUpdates.slice(0, 5).map((u, i) => `${startIdx + i + 1}. ${u.resolvedId}${u.offer_id !== u.resolvedId ? ` (resolved from "${u.offer_id}")` : ""}\n${u.patches.map(p => `   ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}`).join("\n\n")}${resolvedUpdates.length > 5 ? `\n\n... (${resolvedUpdates.length - 5} more)` : ""}
 
-This will PATCH ${resolvedUpdates.length} offer-items.`);
+This will PATCH ${resolvedUpdates.length} offer-items.${endIdx < totalUpdates ? `\n\n⚠️ You supplied ${totalUpdates} updates but only ${limit} will be processed this call. After confirming, you'll get a "call again with offset:${endIdx}" hint to continue.` : ""}`);
       if (check) return check;
 
-      const { results, errors } = await runChunked(resolvedUpdates, async (u) => {
-        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${u.resolvedId}`, "PATCH", offerItemHeaders(token, cfg), u.patches);
-        return { id: u.resolvedId, res };
-      });
+      const SOFT_DEADLINE_MS = 50_000;
+      const t0 = Date.now();
+      const results = [], errors = [];
+      let stopped = false;
+      for (let i = 0; i < resolvedUpdates.length; i += chunk_size) {
+        if (Date.now() - t0 > SOFT_DEADLINE_MS) { stopped = true; break; }
+        const chunk = resolvedUpdates.slice(i, i + chunk_size);
+        const settled = await Promise.all(chunk.map(async (u) => {
+          const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${u.resolvedId}`, "PATCH", offerItemHeaders(token, cfg), u.patches);
+          return { id: u.resolvedId, res };
+        }));
+        for (const { id, res } of settled) {
+          if (res.ok) results.push(id);
+          else        errors.push({ id, error: JSON.stringify(res.body).slice(0, 200) });
+        }
+      }
+
+      const processed  = results.length + errors.length;
+      const nextOffset = startIdx + processed;
+      const hasMore    = nextOffset < totalUpdates;
+      const wallSecs   = ((Date.now() - t0) / 1000).toFixed(1);
 
       return { content: [{ type: "text", text:
-`📦 BULK OFFER UPDATE COMPLETE
-✅ Updated : ${results.length}  |  ❌ Failed: ${errors.length}
-${results.map(id => `  ✅ ${id}`).join("\n")}
-${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}` }] };
+`📦 BULK OFFER UPDATE ${stopped ? "PARTIAL (soft time budget reached)" : "COMPLETE"}
+Window   : ${windowLabel}
+Processed: ${processed} in ${wallSecs}s   ✅ ${results.length} updated   ❌ ${errors.length} failed
+${results.length <= 20 ? results.map(id => `  ✅ ${id}`).join("\n") : results.slice(0, 10).map(id => `  ✅ ${id}`).join("\n") + `\n  ... (${results.length - 20} more) ...\n` + results.slice(-10).map(id => `  ✅ ${id}`).join("\n")}
+${errors.length ? `\nErrors:\n${errors.slice(0, 5).map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}${errors.length > 5 ? `\n  ... (${errors.length - 5} more errors)` : ""}` : ""}
+
+${hasMore
+  ? `⏭️  ${totalUpdates - nextOffset} updates remaining. Call bulk_update_offers again with:\n     offset: ${nextOffset}  (and same updates array, confirmed: true)\n`
+  : `✅ All ${totalUpdates} updates processed.`}` }] };
     })
   );
 
   // ════════ TOOL 43 — bulk_delete_offers ═══════════════════════════════════════
   server.tool("bulk_delete_offers",
-    `Permanently delete multiple offer items in one call. Requires confirmed: true to execute. This cannot be undone — prefer bulk_update_offers (patch /_experience/decisioning/offeritem/lifecycleStatus to "archived") if you may want them back.`,
+    `Permanently delete multiple offer items in one call. Requires confirmed: true. This cannot be undone — prefer bulk_update_offers (patch /_experience/decisioning/offeritem/lifecycleStatus to "archived") if you may want them back. Supports pagination via offset/limit: each call processes at most 30 deletes to stay under Adobe I/O Runtime's 60s cap, then returns a "call again with offset:X" instruction the LLM chains automatically.`,
     {
-      offer_ids:    z.array(z.string()).min(1).describe("Offer item IDs or exact offer names to delete"),
+      offer_ids:    z.array(z.string()).min(1).describe("Offer item IDs or exact offer names to delete."),
       confirmed:    boolish(),
+      offset:       z.number().int().min(0).default(0).describe("Skip this many IDs before processing. Use for pagination on big deletes."),
+      limit:        z.number().int().min(1).max(60).default(30).describe("Process at most this many IDs in this call. Default 30 (safely fits Adobe's 60s function cap given delete latency + jittered 409 retries)."),
+      chunk_size:   z.number().int().min(1).max(10).default(5).describe("How many DELETEs to issue in parallel per chunk. Default 5. Higher risks catalog write-lock 409s (auto-retried) and Runtime timeouts."),
       access_token: z.string().optional(),
     },
-    wrap(async ({ offer_ids, confirmed, access_token }) => {
+    wrap(async ({ offer_ids, confirmed, offset, limit, chunk_size, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
 
       const offerResolve = await resolveOfferIdentifiers(offer_ids, token, cfg);
       if (offerResolve.error) return { content: [{ type: "text", text: `❌ Could not resolve offer_ids: ${offerResolve.error}` }] };
-      const resolvedIds = offerResolve.ids;
+      const allIds = offerResolve.ids;
+
+      const totalIds  = allIds.length;
+      const startIdx  = Math.min(offset, totalIds);
+      const endIdx    = Math.min(offset + limit, totalIds);
+      const idsWindow = allIds.slice(startIdx, endIdx);
+      const windowLabel = `IDs ${startIdx + 1}-${endIdx} of ${totalIds}`;
 
       const check = await needsConfirmation(server, confirmed,
-`OFFERS TO DELETE: ${resolvedIds.length}
+`OFFERS TO DELETE: ${idsWindow.length} (window: ${windowLabel})
 Sandbox : ${cfg.SANDBOX_NAME}
 
-${resolvedIds.map((id, i) => `  ${i + 1}. ${id}${offer_ids[i] !== id ? ` (resolved from "${offer_ids[i]}")` : ""}`).join("\n")}
+${idsWindow.slice(0, 10).map((id, i) => `  ${startIdx + i + 1}. ${id}`).join("\n")}${idsWindow.length > 10 ? `\n  ... (${idsWindow.length - 10} more)` : ""}
 
-⚠️  This cannot be undone. Prefer bulk_update_offers (patch /_experience/decisioning/offeritem/lifecycleStatus to "archived") if you may want these back.
+⚠️  This cannot be undone. Prefer bulk_update_offers (patch lifecycleStatus="archived") if you may want these back.${endIdx < totalIds ? `\n\n⚠️ You supplied ${totalIds} IDs but only ${limit} will be processed this call. After confirming, you'll get a "call again with offset:${endIdx}" hint to continue.` : ""}
 
-This will DELETE ${resolvedIds.length} offer-items.`);
+This will DELETE ${idsWindow.length} offer-items.`);
       if (check) return check;
 
-      const { results, errors } = await runChunked(resolvedIds, async (id) => {
-        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${id}`, "DELETE", offerItemHeaders(token, cfg));
-        return { id, res };
-      });
+      // Soft deadline so we return partial results gracefully instead of being
+      // killed at Runtime's 60s cap. 409 catalog-conflict retries can add ~2s
+      // per failed request, so we budget conservatively.
+      const SOFT_DEADLINE_MS = 50_000;
+      const t0 = Date.now();
+      const results = [], errors = [];
+      let stopped = false;
+      for (let i = 0; i < idsWindow.length; i += chunk_size) {
+        if (Date.now() - t0 > SOFT_DEADLINE_MS) { stopped = true; break; }
+        const chunk = idsWindow.slice(i, i + chunk_size);
+        const settled = await Promise.all(chunk.map(async (id) => {
+          const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${id}`, "DELETE", offerItemHeaders(token, cfg));
+          return { id, res };
+        }));
+        for (const { id, res } of settled) {
+          if (res.ok) results.push(id);
+          else        errors.push({ id, error: JSON.stringify(res.body).slice(0, 200) });
+        }
+      }
+
+      const processed  = results.length + errors.length;
+      const nextOffset = startIdx + processed;
+      const hasMore    = nextOffset < totalIds;
+      const wallSecs   = ((Date.now() - t0) / 1000).toFixed(1);
 
       return { content: [{ type: "text", text:
-`📦 BULK OFFER DELETE COMPLETE
-✅ Deleted : ${results.length}  |  ❌ Failed: ${errors.length}
-${results.map(id => `  ✅ ${id}`).join("\n")}
-${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}` }] };
+`📦 BULK OFFER DELETE ${stopped ? "PARTIAL (soft time budget reached)" : "COMPLETE"}
+Window   : ${windowLabel}
+Processed: ${processed} in ${wallSecs}s   ✅ ${results.length} deleted   ❌ ${errors.length} failed
+${results.length <= 20 ? results.map(id => `  ✅ ${id}`).join("\n") : results.slice(0, 10).map(id => `  ✅ ${id}`).join("\n") + `\n  ... (${results.length - 20} more) ...\n` + results.slice(-10).map(id => `  ✅ ${id}`).join("\n")}
+${errors.length ? `\nErrors:\n${errors.slice(0, 5).map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}${errors.length > 5 ? `\n  ... (${errors.length - 5} more errors)` : ""}` : ""}
+
+${hasMore
+  ? `⏭️  ${totalIds - nextOffset} IDs remaining. Call bulk_delete_offers again with:\n     offset: ${nextOffset}  (and same offer_ids array, confirmed: true)\n`
+  : `✅ All ${totalIds} IDs processed.`}` }] };
     })
   );
 
