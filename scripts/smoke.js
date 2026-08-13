@@ -68,7 +68,7 @@ async function runStdio() {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
   const list = await send("tools/list", {});
-  assert((list.result?.tools || []).length === 21, "stdio lists 21 tools (got " + (list.result?.tools?.length || 0) + ")");
+  assert((list.result?.tools || []).length === 44, "stdio lists 44 tools (got " + (list.result?.tools?.length || 0) + ")");
 
   // No-API tools: should work without credentials
   const csv = `name,category,discount_percent,priority\nSummer Kit,Skincare,20,1\nLoyalty 10,Discount,10,2`;
@@ -101,6 +101,106 @@ async function runStdio() {
   } else {
     assert(ruleText.includes("Missing required config") || ruleText.includes("Missing credentials"),
       "create_eligibility_rule errors cleanly when creds missing");
+  }
+
+  // ── New list_* tools (tools 28/31/34/37) — same success/failure branching as get_setup_summary ──
+  const listChecks = [
+    ["list_collections",          "Collections"],
+    ["list_eligibility_rules",    "Eligibility rules"],
+    ["list_ranking_formulas",     "Ranking formulas"],
+    ["list_selection_strategies", "Selection strategies"],
+  ];
+  for (const [toolName, label] of listChecks) {
+    const res = await send("tools/call", { name: toolName, arguments: { limit: 5 } });
+    const text = res.result?.content?.[0]?.text || "";
+    if (HAS_CREDS) {
+      assert(text.includes(label) || text.includes("⚠️ 0 items"), `${toolName} returns data or a clean empty result`);
+    } else {
+      assert(text.includes("Missing required config") || text.includes("Missing credentials"),
+        `${toolName} errors cleanly when creds missing`);
+    }
+  }
+
+  // ── New get_* tools (tools 27/30/33/36/39) — dummy ID should 404 cleanly, not crash the protocol layer ──
+  const getChecks = [
+    ["get_collection",        "collection_id",  "dps:item-collection:smoketest"],
+    ["get_eligibility_rule",  "rule_id",         "dps:eligibility-rule:smoketest"],
+    ["get_ranking_formula",   "formula_id",      "dps:ranking-function:smoketest"],
+    ["get_selection_strategy","strategy_id",     "dps:selection-strategy:smoketest"],
+    ["get_placement",         "placement_id",    "dps:exd-placement:smoketest"],
+  ];
+  for (const [toolName, argName, dummyId] of getChecks) {
+    const res = await send("tools/call", { name: toolName, arguments: { [argName]: dummyId } });
+    const text = res.result?.content?.[0]?.text || "";
+    if (HAS_CREDS) {
+      assert(text.includes("❌") || text.length > 0, `${toolName} responds cleanly for a non-existent ID (no crash)`);
+    } else {
+      assert(text.includes("Missing required config") || text.includes("Missing credentials"),
+        `${toolName} errors cleanly when creds missing`);
+    }
+  }
+
+  // ── New delete_* tools (tools 29/32/35/38/40/41) — confirmation guard, same pattern as create_eligibility_rule ──
+  const deleteChecks = [
+    ["delete_collection",         "collection_id", "dps:item-collection:smoketest"],
+    ["delete_eligibility_rule",   "rule_id",        "dps:eligibility-rule:smoketest"],
+    ["delete_ranking_formula",    "formula_id",     "dps:ranking-function:smoketest"],
+    ["delete_selection_strategy", "strategy_id",    "dps:selection-strategy:smoketest"],
+    ["delete_offer_item",         "offer_id",       "dps:offer-item:smoketest"],
+    ["delete_placement",          "placement_id",   "dps:exd-placement:smoketest"],
+  ];
+  for (const [toolName, argName, dummyId] of deleteChecks) {
+    const res = await send("tools/call", { name: toolName, arguments: { [argName]: dummyId } });
+    const text = res.result?.content?.[0]?.text || "";
+    if (HAS_CREDS) {
+      // Some resolvers validate existence up front (a dummy ID 404s cleanly
+      // before reaching the confirmation gate); others resolve IDs without an
+      // extra round trip and reach the confirmation gate directly. Either is
+      // an acceptable "did not execute the delete" outcome.
+      assert(text.includes("CONFIRMATION REQUIRED") || text.includes("Could not find") || text.includes("❌"),
+        `${toolName} blocks or fails cleanly without confirmed:true / for an unresolvable ID`);
+    } else {
+      assert(text.includes("Missing required config") || text.includes("Missing credentials"),
+        `${toolName} errors cleanly when creds missing`);
+    }
+  }
+
+  // ── New bulk_update_offers / bulk_delete_offers (tools 42/43) ──
+  const bulkUpdateDry = await send("tools/call", { name: "bulk_update_offers", arguments: {
+    updates: [{ offer_id: "dps:offer-item:smoketest", patches: [{ op: "replace", path: "/_experience/decisioning/decisionitem/itemPriority", value: 9 }] }],
+    dry_run: true,
+  } });
+  const bulkUpdateDryText = bulkUpdateDry.result?.content?.[0]?.text || "";
+  assert(bulkUpdateDryText.includes("DRY RUN"), "bulk_update_offers dry_run works without credentials");
+
+  const bulkUpdateAttempt = await send("tools/call", { name: "bulk_update_offers", arguments: {
+    updates: [{ offer_id: "dps:offer-item:smoketest", patches: [{ op: "replace", path: "/_experience/decisioning/decisionitem/itemPriority", value: 9 }] }],
+  } });
+  const bulkUpdateText = bulkUpdateAttempt.result?.content?.[0]?.text || "";
+  if (HAS_CREDS) {
+    assert(bulkUpdateText.includes("CONFIRMATION REQUIRED"), "bulk_update_offers blocks without confirmed:true");
+  } else {
+    assert(bulkUpdateText.includes("Missing required config") || bulkUpdateText.includes("Missing credentials"),
+      "bulk_update_offers errors cleanly when creds missing");
+  }
+
+  const bulkDeleteAttempt = await send("tools/call", { name: "bulk_delete_offers", arguments: { offer_ids: ["dps:offer-item:smoketest"] } });
+  const bulkDeleteText = bulkDeleteAttempt.result?.content?.[0]?.text || "";
+  if (HAS_CREDS) {
+    assert(bulkDeleteText.includes("CONFIRMATION REQUIRED"), "bulk_delete_offers blocks without confirmed:true");
+  } else {
+    assert(bulkDeleteText.includes("Missing required config") || bulkDeleteText.includes("Missing credentials"),
+      "bulk_delete_offers errors cleanly when creds missing");
+  }
+
+  // ── New attach_offer_eligibility_rule (tool 44) — detach path (no eligibility_rule_id lookup) hits the same confirmation guard ──
+  const attachAttempt = await send("tools/call", { name: "attach_offer_eligibility_rule", arguments: { offer_ids: ["dps:offer-item:smoketest"] } });
+  const attachText = attachAttempt.result?.content?.[0]?.text || "";
+  if (HAS_CREDS) {
+    assert(attachText.includes("CONFIRMATION REQUIRED"), "attach_offer_eligibility_rule (detach path) blocks without confirmed:true");
+  } else {
+    assert(attachText.includes("Missing required config") || attachText.includes("Missing credentials"),
+      "attach_offer_eligibility_rule errors cleanly when creds missing");
   }
 
   child.kill();
@@ -155,7 +255,7 @@ async function runHttp() {
   });
 
   const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-  assert((list.body?.result?.tools || []).length === 21, "http lists 21 tools (got " + (list.body?.result?.tools?.length || 0) + ")");
+  assert((list.body?.result?.tools || []).length === 44, "http lists 44 tools (got " + (list.body?.result?.tools?.length || 0) + ")");
 
   // Call a tool with credentials passed as headers (mimics how Coworker users will connect)
   if (HAS_CREDS) {

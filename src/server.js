@@ -49,6 +49,7 @@ const DEFAULTS = {
   OOB_OFFER_CLASS: "https://ns.adobe.com/experience/decisioning/offeritem",
   BASE_SCHEMA_URL: "https://platform.adobe.io/data/foundation/schemaregistry",
   BASE_DPS_URL:    "https://platform.adobe.io/data/core/dps",
+  BASE_UPS_URL:    "https://platform.adobe.io/data/core/ups",
   IMS_TOKEN_URL:   "https://ims-na1.adobelogin.com/ims/token/v3",
   IMS_SCOPES:      "openid,AdobeID,session,read_organizations,additional_info.projectedProductContext,adobeio_api",
 };
@@ -145,6 +146,14 @@ function placementHeaders(token, config) {
     "Content-Type":     "application/json",
   };
 }
+function rtcdpHeaders(token, config) {
+  return {
+    "Authorization":   `Bearer ${token}`,
+    "x-api-key":        config.CLIENT_ID,
+    "x-gw-ims-org-id":  config.ORG_ID,
+    "x-sandbox-name":   config.SANDBOX_NAME,
+  };
+}
 function schemaHeaders(token, config, accept) {
   return {
     "Authorization":   `Bearer ${token}`,
@@ -157,7 +166,7 @@ function schemaHeaders(token, config, accept) {
 }
 
 // ─── HTTP CALL with safe error handling + retries ─────────────────────────────
-// Adobe Platform APIs return three flavors of retriable failure at scale:
+// Adobe Platform APIs return three flavours of retriable failure at scale:
 //   - 502/503/504 or network errors → transient infra hiccup
 //   - 429 with Retry-After header    → rate limit, honor the header
 //   - 409 "Entity update has conflict with another operation"
@@ -211,8 +220,838 @@ function extractItems(body) {
   return body.results || body.items || body._embedded?.items || body.data || [];
 }
 
+// Runs `fn(item)` over `items` in concurrency-limited chunks — avoids blowing
+// past Vercel's 60s function timeout on large batches while staying under
+// DPS rate limits. `fn` must resolve to { id, res } where res is an
+// apiCall() result. Shared by every bulk_* tool.
+async function runChunked(items, fn, chunkSize = 5) {
+  const results = [], errors = [];
+  for (let i = 0; i < items.length; i += chunkSize) {
+    const chunk = items.slice(i, i + chunkSize);
+    const settled = await Promise.all(chunk.map(fn));
+    for (const { id, res } of settled) {
+      if (res.ok) results.push(id);
+      else        errors.push({ id, error: JSON.stringify(res.body) });
+    }
+  }
+  return { results, errors };
+}
+
+// Paginates through a DPS list endpoint (bounded — 20 pages of 100, plenty for
+// name-lookup purposes) and returns every item, for the name-resolution
+// helpers below.
+async function fetchAllItems(urlBase, headers) {
+  const PAGE_SIZE = 100, MAX_PAGES = 20;
+  const all = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await apiCall(`${urlBase}&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`, "GET", headers);
+    if (!res.ok) return { items: null, error: `(${res.status}): ${JSON.stringify(res.body)}` };
+    const items = extractItems(res.body);
+    all.push(...items);
+    if (items.length < PAGE_SIZE) break;
+  }
+  return { items: all, error: null };
+}
+
+// Resolves a mixed array of offer IDs / exact offer names into pure IDs.
+// Anything starting with "dps:" is treated as an ID already (no lookup);
+// everything else is matched against itemName. A name matching zero or more
+// than one offer fails with a consolidated error rather than guessing.
+async function resolveOfferIdentifiers(identifiers, token, cfg) {
+  const needsLookup = identifiers.some(x => !x.startsWith("dps:"));
+  if (!needsLookup) return { ids: identifiers, error: null };
+
+  const { items, error } = await fetchAllItems(`${DEFAULTS.BASE_DPS_URL}/offer-items?`, offerItemHeaders(token, cfg));
+  if (error) return { ids: null, error: `Could not list offer items to resolve names ${error}` };
+
+  const byName = new Map();
+  for (const it of items) {
+    const name = it._experience?.decisioning?.decisionitem?.itemName;
+    if (!name) continue;
+    if (!byName.has(name)) byName.set(name, []);
+    byName.get(name).push(it.id);
+  }
+
+  const errors = [];
+  const resolved = identifiers.map(x => {
+    if (x.startsWith("dps:")) return x;
+    const matches = byName.get(x) || [];
+    if (matches.length === 0) { errors.push(`No offer item found with name "${x}"`); return null; }
+    if (matches.length > 1)  { errors.push(`Name "${x}" matches ${matches.length} offer items — ambiguous: ${matches.join(", ")}. Use an ID instead.`); return null; }
+    return matches[0];
+  });
+
+  return errors.length ? { ids: null, error: errors.join(" | ") } : { ids: resolved, error: null };
+}
+
+// Resolves an eligibility-rule ID or exact rule name to {id, name}. Always
+// validates existence (a direct GET for an already-given ID; a name match
+// for a lookup) so callers get one consistent shape either way.
+async function resolveEligibilityRuleIdentifier(identifier, token, cfg) {
+  if (identifier.startsWith("dps:")) {
+    const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules/${identifier}`, "GET", dpsHeaders(token, cfg));
+    if (!res.ok) return { id: null, name: null, body: null, error: `Could not find eligibility rule ${identifier} (${res.status}): ${JSON.stringify(res.body)}` };
+    return { id: identifier, name: res.body.name, body: res.body, error: null };
+  }
+
+  const { items, error } = await fetchAllItems(`${DEFAULTS.BASE_DPS_URL}/offer-rules?property=exdRule%3D%3Dtrue&`, dpsHeaders(token, cfg));
+  if (error) return { id: null, name: null, body: null, error: `Could not list eligibility rules to resolve name ${error}` };
+
+  const matches = items.filter(r => r.name === identifier);
+  if (matches.length === 0) return { id: null, name: null, body: null, error: `No eligibility rule found with name "${identifier}"` };
+  if (matches.length > 1)  return { id: null, name: null, body: null, error: `Name "${identifier}" matches ${matches.length} eligibility rules (${matches.map(m => m.id).join(", ")}) — ambiguous. Use an ID instead.` };
+  // List items may be summary-only — body is left null so the caller does a final GET for the full object.
+  return { id: matches[0].id, name: matches[0].name, body: null, error: null };
+}
+
+// Generic ID-or-name resolver shared by the remaining get_* tools (collection,
+// ranking formula, selection strategy, placement). Tries a direct GET first
+// (also doubling as existence validation and giving the caller the full body
+// for free); falls back to an exact-name search across the resource's list
+// endpoint, same ambiguous/missing-name error handling as the resolvers above.
+async function resolveByIdOrName({ identifier, directUrl, listUrl, headers, resourceLabel }) {
+  if (identifier.startsWith("dps:")) {
+    const res = await apiCall(directUrl(identifier), "GET", headers);
+    if (!res.ok) return { id: null, body: null, error: `Could not find ${resourceLabel} ${identifier} (${res.status}): ${JSON.stringify(res.body)}` };
+    return { id: identifier, body: res.body, error: null };
+  }
+
+  const { items, error } = await fetchAllItems(listUrl, headers);
+  if (error) return { id: null, body: null, error: `Could not list ${resourceLabel}s to resolve name ${error}` };
+
+  const matches = items.filter(x => x.name === identifier);
+  if (matches.length === 0) return { id: null, body: null, error: `No ${resourceLabel} found with name "${identifier}"` };
+  if (matches.length > 1)  return { id: null, body: null, error: `Name "${identifier}" matches ${matches.length} ${resourceLabel}s (${matches.map(m => m.id).join(", ")}) — ambiguous. Use an ID instead.` };
+  return { id: matches[0].id, body: null, error: null };
+}
+
+function resolveCollectionIdentifier(identifier, token, cfg) {
+  return resolveByIdOrName({
+    identifier, resourceLabel: "collection",
+    directUrl: (id) => `${DEFAULTS.BASE_DPS_URL}/item-collections/${id}`,
+    listUrl: `${DEFAULTS.BASE_DPS_URL}/item-collections?`,
+    headers: dpsHeaders(token, cfg),
+  });
+}
+function resolveRankingFormulaIdentifier(identifier, token, cfg) {
+  return resolveByIdOrName({
+    identifier, resourceLabel: "ranking formula",
+    directUrl: (id) => `${DEFAULTS.BASE_DPS_URL}/ranking-formulas/${id}`,
+    listUrl: `${DEFAULTS.BASE_DPS_URL}/ranking-formulas?property=exdFunction%3D%3Dtrue&`,
+    headers: dpsHeaders(token, cfg),
+  });
+}
+function resolveSelectionStrategyIdentifier(identifier, token, cfg) {
+  return resolveByIdOrName({
+    identifier, resourceLabel: "selection strategy",
+    directUrl: (id) => `${DEFAULTS.BASE_DPS_URL}/selection-strategies/${id}`,
+    listUrl: `${DEFAULTS.BASE_DPS_URL}/selection-strategies?`,
+    headers: dpsHeaders(token, cfg),
+  });
+}
+function resolvePlacementIdentifier(identifier, token, cfg) {
+  return resolveByIdOrName({
+    identifier, resourceLabel: "placement",
+    directUrl: (id) => `${DEFAULTS.BASE_DPS_URL}/exd-placements/${id}`,
+    listUrl: `${DEFAULTS.BASE_DPS_URL}/exd-placements?`,
+    headers: placementHeaders(token, cfg),
+  });
+}
+
+// ─── Real-Time CDP audience (segment) support ─────────────────────────────────
+// Audiences are a genuinely separate resource from eligibility rules — managed
+// under their own Audience tab / Unified Profile Segmentation Service, not the
+// offer-rules endpoint. But the only mechanism that actually attaches
+// something to an offer's itemConstraints is profileConstraintType:
+// "eligibilityRule" — confirmed empirically that "audience"/"segment" as a
+// profileConstraintType value are rejected identically to a garbage value.
+// So "attach an audience" works by wrapping a segment-membership check in a
+// real eligibility rule (auto-generated, named "Audience: <name>", reused by
+// that exact name on repeat calls) and attaching THAT rule's ID exactly like
+// any other decision rule.
+//
+// CONFIRMED PQL syntax for segment membership (found by iterating against the
+// real PQL parser's error messages until it accepted a real segment ID):
+//   segmentMembership["ups"]["<segment-id>"]["status"].equals("realized", false)
+// Both map levels need bracket indexing (segmentMembership is
+// Map[STRING => Map[STRING => OBJECT]]) — dot access on either level fails
+// with a type error, and infix == fails to parse; only the method-call
+// comparison form works, consistent with every other PQL string comparison
+// confirmed elsewhere in this file.
+function segmentMembershipPql(segmentId) {
+  return `segmentMembership["ups"]["${segmentId}"]["status"].equals("realized", false)`;
+}
+
+async function fetchAllAudiences(token, cfg) {
+  const PAGE_SIZE = 100, MAX_PAGES = 20;
+  const all = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await apiCall(`${DEFAULTS.BASE_UPS_URL}/segment/definitions?limit=${PAGE_SIZE}&start=${page}`, "GET", rtcdpHeaders(token, cfg));
+    if (!res.ok) return { items: null, error: `(${res.status}): ${JSON.stringify(res.body)}` };
+    const items = res.body.segments || [];
+    all.push(...items);
+    if (items.length < PAGE_SIZE) break;
+  }
+  return { items: all, error: null };
+}
+
+// Resolves an audience ID or exact name to {id, name}. IDs here are plain
+// UPS segment UUIDs (no "dps:" prefix to sniff), so we try a direct GET first
+// and fall back to a name search — works for either input without needing to
+// guess the format.
+async function resolveAudienceIdentifier(identifier, token, cfg) {
+  const direct = await apiCall(`${DEFAULTS.BASE_UPS_URL}/segment/definitions/${identifier}`, "GET", rtcdpHeaders(token, cfg));
+  if (direct.ok) return { id: identifier, name: direct.body.name, error: null };
+
+  const { items, error } = await fetchAllAudiences(token, cfg);
+  if (error) return { id: null, name: null, error: `Could not list audiences to resolve name ${error}` };
+
+  const matches = items.filter(a => a.name === identifier);
+  if (matches.length === 0) return { id: null, name: null, error: `No audience found with ID or name "${identifier}"` };
+  if (matches.length > 1)  return { id: null, name: null, error: `Name "${identifier}" matches ${matches.length} audiences (${matches.map(m => m.id).join(", ")}) — ambiguous. Use an ID instead.` };
+  return { id: matches[0].id, name: matches[0].name, error: null };
+}
+
+// Finds (by the deterministic "Audience: <name>" naming convention) or
+// creates the eligibility rule that wraps a given audience's segment
+// membership. Reused across repeat attach calls for the same audience rather
+// than creating a duplicate rule each time. Only call this once the caller
+// has actually confirmed the write — it creates real state (a new
+// eligibility rule) when no matching one exists yet.
+async function ensureAudienceEligibilityRule(audienceId, audienceName, token, cfg) {
+  const ruleName = `Audience: ${audienceName}`;
+  const lookup = await resolveEligibilityRuleIdentifier(ruleName, token, cfg);
+  if (lookup.id) return { id: lookup.id, name: lookup.name, reused: true, error: null };
+  if (lookup.error && lookup.error.includes("ambiguous")) return { id: null, name: null, reused: false, error: lookup.error };
+
+  const pql = segmentMembershipPql(audienceId);
+  const description = `Auto-generated eligibility rule for audience "${audienceName}" (segment ${audienceId}).`;
+  const { segmentModel } = pqlToSegmentModel({ pql, name: ruleName, description });
+  const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules`, "POST", dpsHeaders(token, cfg), {
+    name: ruleName, description, exdRule: true,
+    condition: { type: "PQL", format: "pql/text", value: pql },
+    segmentModel,
+  });
+  if (!res.ok) return { id: null, name: null, reused: false, error: `Could not create eligibility rule for audience "${audienceName}" (${res.status}): ${JSON.stringify(res.body)}` };
+  return { id: res.body.id, name: ruleName, reused: false, error: null };
+}
+
+// ─── PQL → segmentModel translator ────────────────────────────────────────────
+// AJO's Segment/Rule Builder UI renders eligibility rules from `segmentModel`,
+// not from the raw `condition.value` PQL string. Rules created via this API
+// with only `condition` still evaluate correctly at runtime, but open as a
+// blank/uneditable card in the UI's Rule Builder.
+//
+// This is a recursive-descent parser for boolean PQL over profile attributes
+// (event-attribute PQL is explicitly out of scope — xEventAttributesContainer
+// is always left empty). Confirmed against real UI-created segmentModel
+// examples:
+//   - single condition                        → flat profileAttributesContainer,
+//                                                 logicalOperator "and", 1 item
+//   - "A and B or C" (and binds tighter than or)
+//                                               → top container logicalOperator
+//                                                 "or", items = [nested AND
+//                                                 segmentContainer{A,B}, item C]
+//   - comparisonType "equals" and "notEqualTo" confirmed from real rules
+//   - comparisonType "startsWith", "endsWith", "contains", "isNull",
+//     "isNotNull", "doesNotContain", "doesNotStartWith", "doesNotEndWith" all
+//     confirmed from a second real rule
+//   - Infix operators (field != value) preserve their LITERAL symbol as
+//     comparisonType (e.g. "!=", not "notEqualTo") and use a scalar value
+//     matching the literal's actual type (bool/number/string), NOT an
+//     array — confirmed via `personalEmail.primary != false` →
+//     { comparisonType: "!=", value: false, isCaseSensitive: false }.
+//     This is a real, confirmed divergence from method-call style, which
+//     always array-wraps string values, e.g. `.equals("Delhi", false)` →
+//     value: ["Delhi"].
+//   - Empty-string arguments produce value: [] (not [""]) — confirmed via
+//     `.notEqualTo("", false)` → value: [].
+//
+// Anything not in the CONFIRMED set below is a best-effort extrapolation —
+// flagged as such in the returned warning so results can be spot-checked in
+// AJO's Rule Builder rather than trusted blindly.
+
+// String-arg method comparisons all share the same shape: field.method("val",
+// caseSensitive?) → array-wrapped value, empty string collapses to [].
+function stringMethodPattern(methodName, comparisonType, confirmed) {
+  return {
+    re: new RegExp(`^(?:profile\\.)?([\\w.]+)\\.${methodName}\\(\\s*"([^"]*)"\\s*(?:,\\s*(true|false)\\s*)?\\)$`),
+    confirmed,
+    build: (m) => ({ comparisonType, value: m[2] === "" ? [] : [m[2]], isCaseSensitive: m[3] === "true", field: m[1] }),
+  };
+}
+
+// Parses an infix RHS literal into its native JS scalar type — string
+// (unwrapped, no array), boolean, or number — matching the confirmed
+// scalar-value convention for infix comparisons.
+function parseInfixLiteral(raw) {
+  const t = raw.trim();
+  if (/^"([^"]*)"$/.test(t)) return t.slice(1, -1);
+  if (t === "true") return true;
+  if (t === "false") return false;
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  return t;
+}
+
+const PQL_COMPARISON_PATTERNS = [
+  // ── String-arg method calls — CONFIRMED shape/value handling ──────────────
+  stringMethodPattern("equals",            "equals",            true),
+  stringMethodPattern("notEqualTo",        "notEqualTo",        true),
+  stringMethodPattern("contains",          "contains",          true),
+  stringMethodPattern("startsWith",        "startsWith",        true),
+  stringMethodPattern("endsWith",          "endsWith",          true),
+  stringMethodPattern("doesNotContain",    "doesNotContain",    true),
+  stringMethodPattern("doesNotStartWith",  "doesNotStartWith",  true),
+  stringMethodPattern("doesNotEndWith",    "doesNotEndWith",    true),
+
+  // field.isNull()  /  field.isNotNull()               — CONFIRMED, no args, empty value array
+  { re: /^(?:profile\.)?([\w.]+)\.isNull\(\)$/,
+    confirmed: true,
+    build: (m) => ({ comparisonType: "isNull", value: [], isCaseSensitive: false, field: m[1] }) },
+  { re: /^(?:profile\.)?([\w.]+)\.isNotNull\(\)$/,
+    confirmed: true,
+    build: (m) => ({ comparisonType: "isNotNull", value: [], isCaseSensitive: false, field: m[1] }) },
+
+  // field != literal  /  field == literal              — "!=" CONFIRMED (boolean case);
+  // "==" assumed symmetric but not independently observed. Literal symbol
+  // preserved as comparisonType; value is a scalar matching the literal type.
+  { re: /^(?:profile\.)?([\w.]+)\s*(!=)\s*(true|false|-?[\d.]+|"[^"]*")$/,
+    confirmed: true,
+    build: (m) => ({ comparisonType: "!=", value: parseInfixLiteral(m[3]), isCaseSensitive: false, field: m[1] }) },
+  { re: /^(?:profile\.)?([\w.]+)\s*(==)\s*(true|false|-?[\d.]+|"[^"]*")$/,
+    confirmed: false,
+    build: (m) => ({ comparisonType: "==", value: parseInfixLiteral(m[3]), isCaseSensitive: false, field: m[1] }) },
+
+  // field.in(["a","b",...])                            — inferred
+  { re: /^(?:profile\.)?([\w.]+)\.in\(\s*\[([^\]]*)\]\s*\)$/,
+    confirmed: false,
+    build: (m) => ({ comparisonType: "isAnyOf",
+      value: m[2].split(",").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean),
+      isCaseSensitive: false, field: m[1] }) },
+
+  // field.greaterThan(value) / field.lessThan(value)   — inferred (method-call form)
+  { re: /^(?:profile\.)?([\w.]+)\.greaterThan\(\s*(-?[\d.]+)\s*\)$/,
+    confirmed: false,
+    build: (m) => ({ comparisonType: "greaterThan", value: Number(m[2]), isCaseSensitive: false, field: m[1] }) },
+  { re: /^(?:profile\.)?([\w.]+)\.lessThan\(\s*(-?[\d.]+)\s*\)$/,
+    confirmed: false,
+    build: (m) => ({ comparisonType: "lessThan", value: Number(m[2]), isCaseSensitive: false, field: m[1] }) },
+
+  // field > value / < / >= / <=  (numeric, unquoted)   — inferred, extrapolated
+  // from the confirmed "!=" pattern: literal symbol preserved, scalar value.
+  { re: /^(?:profile\.)?([\w.]+)\s*(>=|<=|>|<)\s*(-?[\d.]+)$/,
+    confirmed: false,
+    build: (m) => ({ comparisonType: m[2], value: Number(m[3]), isCaseSensitive: false, field: m[1] }) },
+];
+
+function matchComparison(raw) {
+  const trimmed = raw.trim();
+  for (const p of PQL_COMPARISON_PATTERNS) {
+    const m = trimmed.match(p.re);
+    if (m) return { ...p.build(m), confirmed: p.confirmed, raw: trimmed };
+  }
+  return null;
+}
+
+// Recursive-descent parser: expr := or ; or := and (OR and)* ; and := term (AND term)* ;
+// term := '(' or ')' | comparison-leaf. Whole-word "and"/"or" only count as
+// operators outside quotes and outside a comparison's own argument parens, so
+// values like "Simon and Garfunkel" or nested method calls don't get split.
+function parsePqlBoolean(pql) {
+  const s = pql;
+  let i = 0;
+  let hasUnclosedParen = false;
+
+  function isWordBoundaryAt(pos) { return !/[a-zA-Z0-9_]/.test(s[pos] || ""); }
+  function skipWs() { while (i < s.length && /\s/.test(s[i])) i++; }
+  function peekKeyword(word) {
+    skipWs();
+    const slice = s.slice(i, i + word.length);
+    return slice.toLowerCase() === word && isWordBoundaryAt(i + word.length) && (i === 0 || isWordBoundaryAt(i - 1));
+  }
+
+  function parseOr() {
+    const children = [parseAnd()];
+    while (true) {
+      skipWs();
+      if (peekKeyword("or")) { i += 2; children.push(parseAnd()); }
+      else break;
+    }
+    return children.length === 1 ? children[0] : { type: "or", children };
+  }
+
+  function parseAnd() {
+    const children = [parseTerm()];
+    while (true) {
+      skipWs();
+      if (peekKeyword("and")) { i += 3; children.push(parseTerm()); }
+      else break;
+    }
+    return children.length === 1 ? children[0] : { type: "and", children };
+  }
+
+  function parseTerm() {
+    skipWs();
+    if (s[i] === "(") {
+      i++;
+      const node = parseOr();
+      skipWs();
+      if (s[i] === ")") i++;
+      else hasUnclosedParen = true; // reached end of input without a matching ")"
+      return node;
+    }
+    return parseLeaf();
+  }
+
+  function parseLeaf() {
+    skipWs();
+    const start = i;
+    let depth = 0, inQuote = false;
+    while (i < s.length) {
+      const c = s[i];
+      if (c === '"') { inQuote = !inQuote; i++; continue; }
+      if (inQuote) { i++; continue; }
+      if (c === "(") { depth++; i++; continue; }
+      if (c === ")") {
+        if (depth === 0) break; // closes an outer group we're inside of
+        depth--; i++; continue;
+      }
+      if (depth === 0 && /\s/.test(c)) {
+        const save = i;
+        skipWs();
+        if (peekKeyword("and") || peekKeyword("or")) { i = save; break; }
+        continue;
+      }
+      i++;
+    }
+    return { type: "leaf", raw: s.slice(start, i).trim() };
+  }
+
+  const ast = parseOr();
+  skipWs();
+  return { ast, fullyConsumed: i >= s.length && !hasUnclosedParen };
+}
+
+// Converts the AST into segment items, collecting warnings for any leaf that
+// didn't match a known pattern (placeholder) or matched only an unconfirmed one.
+function astToContainer(node, warnings) {
+  if (node.type === "leaf") {
+    const matched = matchComparison(node.raw);
+    if (!matched) {
+      warnings.push(`Could not parse condition "${node.raw}" — left as an empty placeholder item. Rebuild this condition manually in AJO's Rule Builder.`);
+      return {
+        comparisonType: "equals", component: { id: "profile.unknown", __entity__: true, type: "xk" },
+        isCaseSensitive: true, isPlaceholder: true, originalLocation: [], value: [],
+        itemType: "segmentRule",
+      };
+    }
+    if (!matched.confirmed) {
+      warnings.push(`Condition "${node.raw}" used comparisonType "${matched.comparisonType}", which is inferred (not yet confirmed against a real UI-created rule) — verify it renders correctly in AJO's Rule Builder.`);
+    }
+    return {
+      comparisonType:   matched.comparisonType,
+      component:        { id: `profile.${matched.field}`, __entity__: true, type: "xk" },
+      isCaseSensitive:  matched.isCaseSensitive,
+      isPlaceholder:    false,
+      originalLocation: [],
+      value:            matched.value,
+      itemType:         "segmentRule",
+    };
+  }
+  // "and" / "or" node → segmentContainer wrapping its children (each child is
+  // itself either a segmentRule leaf or a nested segmentContainer).
+  return {
+    exclude: false,
+    isCollapsed: false,
+    items: node.children.map(child => astToContainer(child, warnings)),
+    logicalOperator: node.type,
+    itemType: "segmentContainer",
+  };
+}
+
+function pqlToSegmentModel({ pql, name, description, mergePolicyId }) {
+  const warnings = [];
+  let profileAttributesContainer;
+
+  try {
+    const { ast, fullyConsumed } = parsePqlBoolean(pql);
+    if (!fullyConsumed) {
+      warnings.push(`PQL "${pql}" has trailing content the parser couldn't consume (e.g. unbalanced parentheses) — segmentModel may be incomplete. Verify in AJO's Rule Builder.`);
+    }
+    const rootItem = astToContainer(ast, warnings);
+    // The root of profileAttributesContainer IS the top-level and/or container
+    // shape. If the whole PQL was a single leaf (no and/or at all), wrap it in
+    // a container with the default "and" operator, matching confirmed
+    // single-condition examples.
+    profileAttributesContainer = rootItem.itemType === "segmentContainer"
+      ? rootItem
+      : { exclude: false, isCollapsed: false, items: [rootItem], logicalOperator: "and", itemType: "segmentContainer" };
+  } catch (err) {
+    warnings.push(`PQL "${pql}" failed to parse (${err.message}) — segmentModel attached with an empty profileAttributesContainer. Rebuild manually in AJO's Rule Builder.`);
+    profileAttributesContainer = { exclude: false, isCollapsed: false, items: [], logicalOperator: "and", itemType: "segmentContainer" };
+  }
+
+  return {
+    warning: warnings.length ? warnings.join(" | ") : null,
+    segmentModel: {
+      lifecycleState: "published",
+      expression: {
+        isValid: true,
+        logicalOperator: "and",
+        profileAttributesContainer,
+        xEventAttributesContainer: {
+          exclude: false, isCollapsed: false, items: [],
+          logicalOperator: "then", itemType: "eventTypeCardContainer",
+        },
+        itemType: "segmentDefinition",
+      },
+      isMissingAnsibleModel: false,
+      relationalExpression: false,
+      deprecated: { status: false, reason: "" },
+      description: description || "",
+      evaluationInfo: {
+        batch: { enabled: true },
+        continuous: { enabled: false },
+        synchronous: { enabled: false },
+      },
+      payloadInfo: { schemaPath: "" },
+      labels: [],
+      tags: [],
+      canHaveFolder: true,
+      mergePolicyId: mergePolicyId || undefined,
+      name,
+      namespace: "ups",
+    },
+  };
+}
+
+// ─── Collection filter PQL → uiModel translator ───────────────────────────────
+// item-collections use a different constraint format than eligibility rules:
+// `uiModel` is a JSON string of {operator, value:{left, right}} targeting
+// offer/decision-item fields (not profile fields), reused recursively for
+// compound AND/OR via {operator:"and"|"or", value:[...]}.
+//
+// CONFIRMED from a real multi-condition collection built in AJO's UI:
+//   - compound wrapper shape: {"operator":"or","value":[item, item, item]}
+//     (this was previously an educated guess — now confirmed correct)
+//   - "has"          → LIKE '%value%' style contains match
+//   - "greater than" → numeric >  (NOTE: the pre-existing code in this file
+//                       used "greaterThan" (camelCase) before this was ever
+//                       verified against a real example — that appears to
+//                       have been wrong. Corrected here.)
+//   - "exists"       → IS NOT NULL (the pre-existing code used "isNotNull" —
+//                       also likely wrong, corrected here)
+//   - field prefixing confirmed: OOB fields → _experience.decisioning.decisionitem.<field>,
+//     custom fields → _<tenant>.<field>. itemTags added to the OOB set from
+//     this example (alongside itemName/itemDescription/itemPriority).
+//
+// The real example's operator strings are lowercase, natural-language,
+// space-separated ("greater than", not "greaterThan") — a clearly different
+// convention than eligibility rules' camelCase comparisonType. Every operator
+// below that ISN'T one of the three confirmed above has been re-guessed to
+// follow THIS now-evidenced convention, but remains unconfirmed until you
+// verify one against a real example. "equals" is inherited from pre-existing
+// code — plausible given the convention (it's already a simple lowercase
+// word) but not independently re-confirmed here.
+//
+// One known gap: the real example also includes a `meta` object per item
+// (field title/description/type, for the visual builder's display) which
+// this translator does NOT generate — omitting it should not affect filter
+// evaluation, but the collection may show generic/blank field labels if
+// reopened in AJO's visual Collection Builder until re-saved via the UI.
+
+const OOB_ITEM_FIELDS = new Set(["itemName", "itemDescription", "itemPriority", "itemTags"]);
+function resolveItemFieldPath(field, tenantId) {
+  const first = field.split(".")[0];
+  if (first === "itemCalendarConstraints" || OOB_ITEM_FIELDS.has(first))
+    return `_experience.decisioning.decisionitem.${field}`;
+  if (field.startsWith("_experience.") || field.startsWith(`_${tenantId}.`)) return field;
+  return `_${tenantId}.${field}`;
+}
+
+function stringUiModelPattern(methodName, operator, confirmed) {
+  return {
+    re: new RegExp(`^([\\w.]+)\\.${methodName}\\(\\s*"([^"]*)"\\s*\\)$`),
+    confirmed,
+    build: (m) => ({ operator, left: m[1], right: m[2] }),
+  };
+}
+function numericUiModelPattern(methodName, infixOp, operator, confirmed) {
+  const patterns = [{
+    re: new RegExp(`^([\\w.]+)\\.${methodName}\\(\\s*(-?[\\d.]+)\\s*\\)$`),
+    confirmed, build: (m) => ({ operator, left: m[1], right: Number(m[2]) }),
+  }];
+  if (infixOp) patterns.push({
+    re: new RegExp(`^([\\w.]+)\\s*${infixOp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*(-?[\\d.]+)$`),
+    confirmed: false, build: (m) => ({ operator, left: m[1], right: Number(m[2]) }),
+  });
+  return patterns;
+}
+
+const UIMODEL_COMPARISON_PATTERNS = [
+  // field.equals("value")  /  field == "value"      — inherited, plausible, not re-confirmed
+  stringUiModelPattern("equals", "equals", false),
+  { re: /^([\w.]+)\s*==\s*"([^"]*)"$/, confirmed: false, build: (m) => ({ operator: "equals", left: m[1], right: m[2] }) },
+  // field.notEquals("value")  /  field != "value"    — inferred, guessed to match "equals" convention
+  stringUiModelPattern("notEquals", "not equals", false),
+  { re: /^([\w.]+)\s*!=\s*"([^"]*)"$/, confirmed: false, build: (m) => ({ operator: "not equals", left: m[1], right: m[2] }) },
+  // field.contains("value")                          — CONFIRMED operator name is "has"
+  stringUiModelPattern("contains", "has", true),
+  // field.startsWith / endsWith("value")             — inferred, natural-language guess
+  stringUiModelPattern("startsWith", "starts with", false),
+  stringUiModelPattern("endsWith", "ends with", false),
+  // field.greaterThan(n) / field > n                 — CONFIRMED operator string is "greater than"
+  ...numericUiModelPattern("greaterThan", ">", "greater than", true),
+  // field.lessThan(n) / field < n                    — inferred, symmetric guess
+  ...numericUiModelPattern("lessThan", "<", "less than", false),
+  // field.greaterThanOrEqual(n) / field >= n         — inferred
+  ...numericUiModelPattern("greaterThanOrEqual", ">=", "greater than or equal", false),
+  // field.lessThanOrEqual(n) / field <= n            — inferred
+  ...numericUiModelPattern("lessThanOrEqual", "<=", "less than or equal", false),
+  // field.isNull() / field.isNotNull()               — CONFIRMED "exists" for isNotNull; isNull inferred as its mirror
+  { re: /^([\w.]+)\.isNull\(\)$/, confirmed: false, build: (m) => ({ operator: "does not exist", left: m[1] }) },
+  { re: /^([\w.]+)\.isNotNull\(\)$/, confirmed: true, build: (m) => ({ operator: "exists", left: m[1] }) },
+  // field.in(["a","b"])                              — inferred
+  { re: /^([\w.]+)\.in\(\s*\[([^\]]*)\]\s*\)$/, confirmed: false,
+    build: (m) => ({ operator: "is any of", left: m[1], right: m[2].split(",").map(s => s.trim().replace(/^"|"$/g, "")).filter(Boolean) }) },
+];
+
+// resolveField: (bareField) => fully-qualified field path. Collections resolve
+// bare names against the tenant/OOB heuristics in resolveItemFieldPath; the
+// ranking-formula translator below resolves by stripping a leading "offer."
+// since ranking PQL already spells out the full path.
+function matchUiModelComparison(raw, resolveField) {
+  const trimmed = raw.trim();
+  for (const p of UIMODEL_COMPARISON_PATTERNS) {
+    const m = trimmed.match(p.re);
+    if (m) {
+      const built = p.build(m);
+      return { ...built, left: resolveField(built.left), confirmed: p.confirmed, raw: trimmed };
+    }
+  }
+  return null;
+}
+
+function astToUiModel(node, resolveField, warnings) {
+  if (node.type === "leaf") {
+    const matched = matchUiModelComparison(node.raw, resolveField);
+    if (!matched) {
+      warnings.push(`Could not parse condition "${node.raw}" — omitted from the filter. Add it manually in AJO if needed.`);
+      return null;
+    }
+    if (!matched.confirmed) {
+      warnings.push(`Condition "${node.raw}" used operator "${matched.operator}", which is inferred (not yet confirmed against a real UI-created collection) — verify it filters correctly in AJO.`);
+    }
+    const value = { left: matched.left };
+    if (matched.right !== undefined) value.right = matched.right;
+    return { operator: matched.operator, value };
+  }
+  // "and" / "or" compound node — wrapper shape {operator, value:[...]} is
+  // CONFIRMED (real example used "or" with 3 flat children). Mixed/nested
+  // AND-inside-OR precedence for collections specifically hasn't been seen
+  // yet, though the same mechanism is confirmed for eligibility rules.
+  const childModels = node.children.map(c => astToUiModel(c, resolveField, warnings)).filter(Boolean);
+  return { operator: node.type, value: childModels };
+}
+
+function pqlToUiModel(pql, tenantId) {
+  const resolveField = (field) => resolveItemFieldPath(field, tenantId);
+  const warnings = [];
+  let uiModelObj;
+  const trimmed = pql.trim();
+  if (trimmed.toLowerCase() === "all") {
+    // Preserved exactly as the original confirmed "all offers" default.
+    return { uiModel: `{"operator":"exists","value":{"left":"_experience.decisioning.decisionitem.itemName"}}`, warning: null };
+  }
+  try {
+    const { ast, fullyConsumed } = parsePqlBoolean(trimmed);
+    if (!fullyConsumed) warnings.push(`Filter expression "${pql}" has unparsed trailing content — check for unbalanced parentheses.`);
+    uiModelObj = astToUiModel(ast, resolveField, warnings);
+    if (!uiModelObj) {
+      uiModelObj = { operator: "exists", value: { left: "_experience.decisioning.decisionitem.itemName" } };
+      warnings.push(`Filter expression "${pql}" could not be parsed at all — defaulted to "all offers". Please review.`);
+    }
+  } catch (err) {
+    uiModelObj = { operator: "exists", value: { left: "_experience.decisioning.decisionitem.itemName" } };
+    warnings.push(`Filter expression "${pql}" failed to parse (${err.message}) — defaulted to "all offers".`);
+  }
+  return { uiModel: JSON.stringify(uiModelObj), warning: warnings.length ? warnings.join(" | ") : null };
+}
+
+// ─── Ranking formula PQL → uiModel translator ─────────────────────────────────
+// AJO's visual Ranking Builder renders a ranking formula from `uiModel`, not
+// from the raw `expression.value` PQL string alone — same gap as the
+// eligibility-rule segmentModel and collection uiModel above. Ranking formulas
+// created via this API with only `expression` still evaluate correctly at
+// runtime, but open blank/manual-entry in the visual builder.
+//
+// CONFIRMED shape, from a real UI-created ranking formula:
+//   if (offer._experience.decisioning.decisionitem.itemPriority > 1,  offer._experience.decisioning.decisionitem.itemPriority*5,  offer._experience.decisioning.decisionitem.itemPriority)
+//   → {"criteria":[{"id":"0","index":0,
+//        "assignment":" offer._experience.decisioning.decisionitem.itemPriority*5",
+//        "metadata":{"closed":false},
+//        "expression":{"operator":"greater than","value":{"left":"_experience.decisioning.decisionitem.itemPriority","right":1,"meta":{}}}}],
+//      "finalExpression":" offer._experience.decisioning.decisionitem.itemPriority"}
+//
+// So the uiModel represents a single if/else-if/.../else chain: each `if(...)`
+// becomes one criteria row (condition + the value assigned when it's true),
+// and the innermost non-`if` expression becomes `finalExpression` (the
+// fallback/default). The condition reuses the exact same operator vocabulary
+// and {left,right} shape as the collection uiModel above (confirmed operator
+// here: "greater than", matching the collection translator's confirmed
+// mapping) — just with an added `meta: {}` per-condition, and fields resolved
+// by stripping ranking PQL's explicit "offer." prefix rather than the tenant
+// heuristics collections need (ranking PQL always spells out the full path,
+// e.g. `offer._experience.decisioning.decisionitem.itemPriority`).
+//
+// This only handles a straight-line if/else chain, matching the one confirmed
+// real example. A ranking PQL that isn't of that shape (e.g. an arithmetic
+// combination of multiple independent `if(...)` calls, which the AJO visual
+// builder itself can't represent as a single set of ordered criteria either)
+// gets no uiModel — the formula still works via its PQL expression, it just
+// won't open in the visual builder.
+
+function stripOfferPrefix(field) {
+  return field.replace(/^offer\./i, "");
+}
+
+// Splits a PQL call's argument list on top-level commas (respecting nested
+// parens and quoted strings), and finds an opening paren's matching close —
+// shared helpers for locating a bare `if(cond, then, else)` wrapper.
+function splitTopLevelArgs(s) {
+  const args = [];
+  let depth = 0, start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') { i++; while (i < s.length && s[i] !== '"') i++; continue; }
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === "," && depth === 0) { args.push(s.slice(start, i)); start = i + 1; }
+  }
+  args.push(s.slice(start));
+  return args;
+}
+function findMatchingParen(s, openIdx) {
+  let depth = 0;
+  for (let i = openIdx; i < s.length; i++) {
+    const c = s[i];
+    if (c === '"') { i++; while (i < s.length && s[i] !== '"') i++; continue; }
+    if (c === "(") depth++;
+    else if (c === ")") { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
+// Returns {condition, thenExpr, elseExpr} only if the WHOLE string is exactly
+// one bare `if(...)` call with 3 top-level args — not e.g. `if(...) + if(...)`,
+// which has trailing content after the first call's matching close paren.
+function matchIfCall(pql) {
+  const trimmed = pql.trim();
+  const head = trimmed.match(/^if\s*\(/i);
+  if (!head) return null;
+  const openIdx = head[0].length - 1;
+  const closeIdx = findMatchingParen(trimmed, openIdx);
+  if (closeIdx === -1 || closeIdx !== trimmed.length - 1) return null;
+  const args = splitTopLevelArgs(trimmed.slice(openIdx + 1, closeIdx));
+  if (args.length !== 3) return null;
+  return { condition: args[0].trim(), thenExpr: args[1], elseExpr: args[2] };
+}
+
+// AJO's own ranking-builder-generated uiModel normalizes each assignment/
+// finalExpression to exactly one leading space regardless of how the PQL text
+// was spaced around the comma — confirmed against a real example where the
+// source PQL had 2 spaces after each comma but the uiModel had exactly 1.
+function normalizeExprText(s) {
+  return " " + s.trim();
+}
+
+function pqlToRankingUiModel(pql) {
+  const warnings = [];
+  const criteria = [];
+  let current = pql;
+
+  while (true) {
+    const call = matchIfCall(current);
+    if (!call) break;
+    const matched = matchUiModelComparison(call.condition, stripOfferPrefix);
+    if (!matched) {
+      return { uiModel: null, warning:
+        `Ranking condition "${call.condition}" could not be parsed — no uiModel generated. The formula still works via its PQL expression, but won't render in AJO's visual Ranking Builder.` };
+    }
+    if (!matched.confirmed) {
+      warnings.push(`Ranking condition "${call.condition}" used operator "${matched.operator}", which is inferred (not yet confirmed against a real UI-created ranking formula) — verify it renders correctly in AJO.`);
+    }
+    const value = { left: matched.left };
+    if (matched.right !== undefined) value.right = matched.right;
+    value.meta = {};
+    criteria.push({
+      id: String(criteria.length),
+      index: criteria.length,
+      assignment: normalizeExprText(call.thenExpr),
+      metadata: { closed: false },
+      expression: { operator: matched.operator, value },
+    });
+    current = call.elseExpr;
+  }
+
+  if (!criteria.length) {
+    return { uiModel: null, warning:
+      `Ranking PQL "${pql}" is not a simple if(condition, then, else) expression — no uiModel generated. Compound formulas (e.g. multiple independent if(...) calls combined with +/-) aren't representable as a single set of ordered criteria; the formula still works via its PQL expression.` };
+  }
+
+  return {
+    uiModel: JSON.stringify({ criteria, finalExpression: normalizeExprText(current) }),
+    warning: warnings.length ? warnings.join(" | ") : null,
+  };
+}
+
 // ─── CONFIRMATION + CSV HELPERS ───────────────────────────────────────────────
-function needsConfirmation(confirmed, preview) {
+// Confirmation gate for every write/delete tool. Two paths:
+//
+// 1. PREFERRED — MCP elicitation (server.server.elicitInput). This is a real
+//    protocol-level pause: the client MUST render a form and return a distinct
+//    user action (accept/decline/cancel). A calling agent cannot fabricate
+//    "accept" on its own the way it could set a `confirmed: true` argument —
+//    it has to actually get that value back from the client after the human
+//    interacts with the form. This is what prevents an orchestrating agent
+//    from silently re-invoking a write tool right after collecting an
+//    unrelated missing argument (e.g. treating "here's the name" as if it
+//    were also "yes, create it").
+//
+// 2. FALLBACK — legacy text preview + confirmed:true. Used only when the
+//    connected client doesn't declare the elicitation capability (some stdio
+//    hosts). Less safe — relies on the calling agent actually surfacing the
+//    preview text to the human before re-calling — but keeps the tool usable
+//    everywhere.
+async function needsConfirmation(server, confirmed, preview) {
+  const caps = server?.server?.getClientCapabilities?.();
+  if (caps?.elicitation) {
+    try {
+      const result = await server.server.elicitInput({
+        message:
+`${preview}
+
+Confirm to proceed. Declining or cancelling makes no changes.`,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            confirmed: {
+              type: "boolean",
+              title: "Confirm this write",
+              description: "Set to true to proceed, false to cancel. No changes are made until you confirm.",
+            },
+          },
+          required: ["confirmed"],
+        },
+      });
+      if (result?.action === "accept" && result?.content?.confirmed === true) return null;
+      return { content: [{ type: "text", text: "❌ Cancelled — this action was not confirmed by the user." }] };
+    } catch (err) {
+      // Client declared elicitation but the request itself failed — don't
+      // hard-fail the tool, just fall through to the legacy pattern below.
+    }
+  }
+
   if (confirmed) return null;
   return { content: [{ type: "text", text:
 `⚠️  CONFIRMATION REQUIRED — no changes made yet
@@ -226,6 +1065,31 @@ ${preview}
 function parseCSV(csvText) {
   const result = Papa.parse(String(csvText || "").trim(), { header: true, skipEmptyLines: true, dynamicTyping: false });
   return { columns: result.meta.fields || [], rows: result.data };
+}
+
+// Accepts a bare JSON array of offer objects, or {"offers": [...]}. Produces
+// the same {columns, rows} shape parseCSV does, so downstream offer-building
+// logic (bulk_create_offers) doesn't need to know which format was used.
+// Unlike CSV, values keep their native JSON type (number/boolean/string) —
+// the existing column-processing logic below already tolerates either.
+function parseJSONRows(jsonText) {
+  let data;
+  try { data = JSON.parse(jsonText); }
+  catch (e) { throw new Error(`Invalid JSON in json_text: ${e.message}`); }
+
+  const rows = Array.isArray(data) ? data
+    : Array.isArray(data?.offers) ? data.offers
+    : null;
+  if (!rows) throw new Error(`json_text must be a JSON array of offer objects, or {"offers": [...]}`);
+
+  const columns = [];
+  const seen = new Set();
+  for (const row of rows) {
+    for (const key of Object.keys(row || {})) {
+      if (!seen.has(key)) { seen.add(key); columns.push(key); }
+    }
+  }
+  return { columns, rows };
 }
 
 function inferXdmType(columnName, sampleValues) {
@@ -407,7 +1271,7 @@ ${ranking.map((r,i) => `  ${i+1}. "${r.name}" — ${r.why}`).join("\n")}
         }
       }
 
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `FIELDGROUP TO CREATE:
   Name    : ${fieldgroup_name}
   Schema  : ${cfg.DECISIONING_SCHEMA_ALT_ID}
@@ -472,28 +1336,33 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
 
   // ════════ TOOL 3 — bulk_create_offers ════════════════════════════════════════
   server.tool("bulk_create_offers",
-    "Bulk-create ExD offer items from CSV rows. Each row becomes one offer. Requires confirmed: true to execute — previews payloads first. Use dry_run: true to inspect full JSON payloads. Supports large CSVs (100+) via offset/limit pagination: each call processes up to ~40 offers within Adobe I/O Runtime's 60s function cap, then returns a 'call again with offset:X' hint. LLMs should chain calls automatically for big batches.",
+    `Bulk-create ExD offer items from CSV rows or a JSON array of offer objects. Each row/object becomes one offer. Provide exactly one of csv_text or json_text. Optional per-row eligibility_rule / audience columns restrict that offer's eligibility (at most one of the two per row) — same three-way choice (none / decision rule / audience) as attach_offer_eligibility_rule. Requires confirmed: true to execute — previews payloads first. Use dry_run: true to inspect full JSON payloads. Supports large CSVs (100+ rows) via offset/limit pagination: each call processes up to ~40 offers within Adobe I/O Runtime's 60s function cap, then returns a "call again with offset:X" hint. LLMs should chain calls automatically for big batches.`,
     {
-      csv_text:         z.string().describe("Full CSV text"),
+      csv_text:         z.string().optional().describe(`Full CSV text (header row + data rows). Provide this OR json_text, not both. Optional columns "eligibility_rule" and "audience" (ID or exact name; at most one per row) attach offer-level eligibility.`),
+      json_text:        z.string().optional().describe(`JSON text — either a bare array of offer objects, or {"offers": [...]}. Each object's keys act like CSV column headers (e.g. [{"name":"Summer Kit","category":"Skincare","priority":1,"audience":"DOI Email Targets"}]). Provide this OR csv_text, not both.`),
       lifecycle_status: z.enum(["draft","live","archived"]).default("draft"),
-      dry_run:          boolish().describe("Returns full JSON payloads without calling the API"),
+      dry_run:          boolish().describe("Returns full JSON payloads without calling the API. eligibility_rule/audience columns are shown unresolved (no lookups performed) since dry_run never makes API calls."),
       confirmed:        boolish().describe("Set to true to execute the write. Leave false to preview."),
       chunk_size:       z.number().int().min(1).max(20).default(10).describe("How many offers to POST in parallel per chunk. Default 10, max 20. Larger = faster on big CSVs but risks 429 rate-limits on Adobe DPS (which the retry loop handles)."),
       offset:           z.number().int().min(0).default(0).describe("Skip this many CSV rows before processing. Use for pagination on big CSVs."),
       limit:            z.number().int().min(1).max(200).default(50).describe("Process at most this many rows in this call. Default 50 (safely fits Adobe's 60s function cap). Set higher only if you know your CSV is small."),
       access_token:     z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
-    wrap(async ({ csv_text, lifecycle_status, dry_run, confirmed, chunk_size, offset, limit, access_token }) => {
+    wrap(async ({ csv_text, json_text, lifecycle_status, dry_run, confirmed, chunk_size, offset, limit, access_token }) => {
+      if (!csv_text && !json_text) throw new Error("Provide either csv_text or json_text.");
+      if (csv_text && json_text) throw new Error("Provide only one of csv_text or json_text, not both.");
+
       // Validate config up front so dry_run users get a clear error too.
       const { cfg, token } = dry_run && !confirmed
         ? { cfg: { ...config, ...(describeMissingConfig(config).length ? {} : {}) }, token: null }
         : await requireApiConfig({ access_token });
 
-      const { columns, rows: allRows } = parseCSV(csv_text);
+      const { columns, rows: allRows } = csv_text ? parseCSV(csv_text) : parseJSONRows(json_text);
       const totalRows = allRows.length;
       const startIdx  = Math.min(offset, totalRows);
       const endIdx    = Math.min(offset + limit, totalRows);
       const rows      = allRows.slice(startIdx, endIdx);
+      const windowLabel = `rows ${startIdx + 1}-${endIdx} of ${totalRows}`;
 
       const colLower  = col => col.toLowerCase().replace(/[^a-z0-9_]/g, "_");
       const colMap    = {};
@@ -501,20 +1370,26 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
       const findCol   = keys => { const k = keys.find(k => colMap[k]); return k ? colMap[k] : null; };
       const { startDate: defStart, endDate: defEnd } = defaultDateRange();
 
+      const nameCol  = findCol(["name","offer_name","title","item_name"]);
+      const descCol  = findCol(["description","desc","summary"]);
+      const prioCol  = findCol(["priority","rank","item_priority"]);
+      const startCol = findCol(["start_date","startdate","start","valid_from"]);
+      const endCol   = findCol(["end_date","enddate","expiry","expiry_date","valid_to"]);
+      const eligCol  = findCol(["eligibility_rule","decision_rule","eligibilityrule"]);
+      const audCol   = findCol(["audience","audience_name"]);
+
+      const resolutionErrors = [];
       const payloads = [];
       for (let i = 0; i < rows.length; i++) {
         const row       = rows[i];
-        const nameCol   = findCol(["name","offer_name","title","item_name"]);
-        const descCol   = findCol(["description","desc","summary"]);
-        const prioCol   = findCol(["priority","rank","item_priority"]);
-        const startCol  = findCol(["start_date","startdate","start","valid_from"]);
-        const endCol    = findCol(["end_date","enddate","expiry","expiry_date","valid_to"]);
         const itemName  = nameCol  ? row[nameCol]              : `Offer ${i+1}`;
         const itemDesc  = descCol  ? row[descCol]              : "";
         const itemPrio  = prioCol  ? parseInt(row[prioCol])||1 : 1;
         const startIso  = (startCol && toIsoDate(row[startCol])) || defStart;
         const endIso    = (endCol   && toIsoDate(row[endCol]))   || defEnd;
-        const oobKeys   = new Set([colLower(nameCol||""),colLower(descCol||""),colLower(prioCol||""),colLower(startCol||""),colLower(endCol||""),"id"]);
+        const eligRaw   = eligCol ? row[eligCol] : undefined;
+        const audRaw    = audCol  ? row[audCol]  : undefined;
+        const oobKeys   = new Set([colLower(nameCol||""),colLower(descCol||""),colLower(prioCol||""),colLower(startCol||""),colLower(endCol||""),colLower(eligCol||""),colLower(audCol||""),"id"]);
         const custom    = {};
         for (const col of columns) {
           const key = colLower(col);
@@ -523,8 +1398,35 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
             custom[key] = !isNaN(n) && /^-?\d+(\.\d+)?$/.test(String(row[col]).trim()) ? n : row[col];
           }
         }
+
+        let itemConstraints = { profileConstraintType: "none" };
+        let pendingAudienceName = null;
+        const hasElig = eligRaw !== undefined && eligRaw !== "";
+        const hasAud  = audRaw  !== undefined && audRaw  !== "";
+
+        if (hasElig && hasAud) {
+          resolutionErrors.push(`Row ${i+1} ("${itemName}"): specifies both eligibility_rule and audience — provide at most one.`);
+        } else if (hasElig) {
+          if (dry_run) {
+            itemConstraints = { profileConstraintType: "eligibilityRule", eligibilityRule: `<unresolved: "${eligRaw}">` };
+          } else {
+            const ruleResolve = await resolveEligibilityRuleIdentifier(String(eligRaw), token, cfg);
+            if (ruleResolve.error) resolutionErrors.push(`Row ${i+1} ("${itemName}"): eligibility_rule "${eligRaw}" — ${ruleResolve.error}`);
+            else itemConstraints = { profileConstraintType: "eligibilityRule", eligibilityRule: ruleResolve.id };
+          }
+        } else if (hasAud) {
+          if (dry_run) {
+            itemConstraints = { profileConstraintType: "eligibilityRule", eligibilityRule: `<unresolved audience: "${audRaw}">` };
+          } else {
+            const audienceResolve = await resolveAudienceIdentifier(String(audRaw), token, cfg);
+            if (audienceResolve.error) resolutionErrors.push(`Row ${i+1} ("${itemName}"): audience "${audRaw}" — ${audienceResolve.error}`);
+            else pendingAudienceName = audienceResolve.name;
+          }
+        }
+
         payloads.push({
           name: itemName,
+          pendingAudienceName,
           payload: {
             _experience: {
               decisioning: {
@@ -532,7 +1434,7 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
                 decisionitem: {
                   itemCalendarConstraints: { startDate: startIso, endDate: endIso },
                   itemCatalogID:   cfg.ITEM_CATALOG_ID,
-                  itemConstraints: { profileConstraintType: "none" },
+                  itemConstraints,
                   itemDescription: itemDesc,
                   itemName,
                   itemPriority:    itemPrio,
@@ -544,34 +1446,62 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
         });
       }
 
-      const window = `rows ${startIdx + 1}-${endIdx} of ${totalRows}`;
+      if (resolutionErrors.length)
+        return { content: [{ type: "text", text: `❌ Could not resolve eligibility_rule/audience for ${resolutionErrors.length} row(s):\n${resolutionErrors.map(e => `  • ${e}`).join("\n")}` }] };
 
       if (dry_run) {
-        // Trim preview for big batches to keep the response readable
         const previewPayloads = payloads.slice(0, Math.min(10, payloads.length));
         const truncated = payloads.length > previewPayloads.length;
         return { content: [{ type: "text", text:
-`🔍 DRY RUN — ${payloads.length} offers would be created (window: ${window}, status: ${lifecycle_status}):
+`🔍 DRY RUN — ${payloads.length} offers would be created (window: ${windowLabel}, status: ${lifecycle_status}):
 ${previewPayloads.map((p,i) => `Row ${startIdx + i + 1}: "${p.name}"\n${JSON.stringify(p.payload, null, 2)}`).join("\n\n")}
 ${truncated ? `\n... (${payloads.length - previewPayloads.length} more rows in this window not shown)` : ""}
 
 Call again with dry_run: false and confirmed: true to execute.` }] };
       }
 
-      const preview = `OFFERS TO CREATE: ${payloads.length} (window: ${window})
+      const eligCount = payloads.filter(p => p.payload._experience.decisioning.decisionitem.itemConstraints.profileConstraintType === "eligibilityRule" && !p.pendingAudienceName).length;
+      const audCount  = payloads.filter(p => p.pendingAudienceName).length;
+      const preview = `OFFERS TO CREATE: ${payloads.length} (window: ${windowLabel})
 Status   : ${lifecycle_status}
 Sandbox  : ${cfg.SANDBOX_NAME}
 Catalog  : ${cfg.ITEM_CATALOG_ID}
-
+${eligCount ? `Eligibility rule attached: ${eligCount} offer(s)\n` : ""}${audCount ? `Audience attached: ${audCount} offer(s) (eligibility rule created/reused per distinct audience)\n` : ""}
 OFFER NAMES:
 ${payloads.slice(0, 10).map((p,i) => `  ${startIdx + i + 1}. ${p.name}`).join("\n")}${payloads.length > 10 ? `\n  ... (${payloads.length - 10} more)` : ""}
 
-This will POST ${payloads.length} requests to /offer-items.${endIdx < totalRows ? `\n\n⚠️ CSV has ${totalRows} rows but only ${limit} will be processed this call. After confirming, you'll get a 'call again with offset:${endIdx}' hint to continue.` : ""}`;
-      const check = needsConfirmation(confirmed, preview);
+This will POST ${payloads.length} requests to /offer-items.${endIdx < totalRows ? `\n\n⚠️ CSV has ${totalRows} rows but only ${limit} will be processed this call. After confirming, you'll get a "call again with offset:${endIdx}" hint to continue.` : ""}`;
+      const check = await needsConfirmation(server, confirmed, preview);
       if (check) return check;
 
-      // Run in chunks; also enforce a soft deadline so we return partial results
-      // gracefully instead of getting killed at 60s.
+      // Audience attachment is deferred until after confirmation — materializing
+      // (creating/reusing) the wrapper eligibility rule is a real write, so it
+      // must not happen during preview. One rule per distinct audience, shared
+      // across every row that references it.
+      const audienceNames = [...new Set(payloads.filter(p => p.pendingAudienceName).map(p => p.pendingAudienceName))];
+      if (audienceNames.length) {
+        const ruleIdByAudienceName = new Map();
+        for (const name of audienceNames) {
+          const audienceResolve = await resolveAudienceIdentifier(name, token, cfg);
+          if (audienceResolve.error)
+            return { content: [{ type: "text", text: `❌ Could not re-resolve audience "${name}": ${audienceResolve.error}` }] };
+          const ensured = await ensureAudienceEligibilityRule(audienceResolve.id, audienceResolve.name, token, cfg);
+          if (ensured.error)
+            return { content: [{ type: "text", text: `❌ Could not prepare eligibility rule for audience "${name}": ${ensured.error}` }] };
+          ruleIdByAudienceName.set(name, ensured.id);
+        }
+        for (const p of payloads) {
+          if (p.pendingAudienceName) {
+            p.payload._experience.decisioning.decisionitem.itemConstraints = {
+              profileConstraintType: "eligibilityRule", eligibilityRule: ruleIdByAudienceName.get(p.pendingAudienceName),
+            };
+          }
+        }
+      }
+
+      // Run in chunks; enforce a soft deadline (55s) so we return partial
+      // results gracefully instead of getting killed at Runtime's 60s cap.
+      // 409 catalog write-lock conflicts are auto-retried by apiCall.
       const SOFT_DEADLINE_MS = 55_000;
       const t0 = Date.now();
       const results = [], errors = [];
@@ -594,7 +1524,6 @@ This will POST ${payloads.length} requests to /offer-items.${endIdx < totalRows 
       const hasMore    = nextOffset < totalRows;
       const wallSecs   = ((Date.now() - t0) / 1000).toFixed(1);
 
-      // Show at most 20 result lines to keep responses readable
       const showResults = results.length <= 20
         ? results.map(r => `  ✅ "${r.name}" → ${r.id}`).join("\n")
         : results.slice(0, 10).map(r => `  ✅ "${r.name}" → ${r.id}`).join("\n") +
@@ -603,52 +1532,39 @@ This will POST ${payloads.length} requests to /offer-items.${endIdx < totalRows 
 
       return { content: [{ type: "text", text:
 `📦 BULK OFFER CREATION ${stopped ? "PARTIAL (soft time budget reached)" : "COMPLETE"}
-Window   : ${window}
+Window   : ${windowLabel}
 Processed: ${processed} in ${wallSecs}s   ✅ ${results.length} created   ❌ ${errors.length} failed
 ${showResults}
 ${errors.length ? `\nErrors:\n${errors.slice(0, 5).map(e => `  ❌ "${e.name}" → ${e.error.slice(0, 200)}`).join("\n")}${errors.length > 5 ? `\n  ... (${errors.length - 5} more errors)` : ""}` : ""}
 
 ${hasMore
-  ? `⏭️  ${totalRows - nextOffset} rows remaining. Call bulk_create_offers again with:\n     offset: ${nextOffset}  (and same csv_text, confirmed: true)\n`
+  ? `⏭️  ${totalRows - nextOffset} rows remaining. Call bulk_create_offers again with:\n     offset: ${nextOffset}  (and same csv_text or json_text, confirmed: true)\n`
   : `✅ All ${totalRows} rows processed. Say "create collections" to group these offers.`}` }] };
     })
   );
 
   // ════════ TOOL 4 — create_collection ═════════════════════════════════════════
   server.tool("create_collection",
-    "Create an offer item collection with a filter constraint. Requires confirmed: true to execute.",
+    "Create an offer item collection with a filter constraint. Supports multiple operators (equals, contains, greater/less than, exists, in, etc.) and multi-condition filters combined with and/or. Requires confirmed: true to execute.",
     {
       name:              z.string().describe("Collection display name"),
       description:       z.string().default(""),
-      filter_type:       z.enum(["all","by_name","by_category","by_custom_field","by_priority_gte"]).describe("How to filter offers into this collection"),
-      filter_value:      z.string().optional().describe("Value to filter on — required for all filter types except 'all'"),
-      custom_field_path: z.string().optional().describe("Tenant field path for by_custom_field e.g. category"),
+      filter_expression: z.string().describe(`Filter as a PQL-like expression, or "all" for every offer in the catalog. Examples: 'category.equals("Skincare")', 'itemPriority.greaterThan(3)', 'category.contains("Skin") or itemPriority.greaterThan(3) or itemTags.isNotNull()'. Field names without a prefix are resolved automatically: itemName/itemDescription/itemPriority/itemTags/itemCalendarConstraints → OOB decision-item fields, anything else → tenant custom fields.`),
       confirmed:         boolish().describe("Set to true to execute the write."),
       access_token:      z.string().optional(),
     },
-    wrap(async ({ name, description, filter_type, filter_value, custom_field_path, confirmed, access_token }) => {
+    wrap(async ({ name, description, filter_expression, confirmed, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      let uiModel;
-      if (filter_type === "all")
-        uiModel = `{"operator":"isNotNull","value":{"left":"_experience.decisioning.decisionitem.itemName"}}`;
-      else if (filter_type === "by_name")
-        uiModel = JSON.stringify({ operator:"equals", value:{ left:"_experience.decisioning.decisionitem.itemName", right:filter_value } });
-      else if (filter_type === "by_category" || filter_type === "by_custom_field")
-        uiModel = JSON.stringify({ operator:"equals", value:{ left:`_${cfg.TENANT_ID}.${custom_field_path||"category"}`, right:filter_value } });
-      else if (filter_type === "by_priority_gte") {
-        const n = Number.parseInt(filter_value, 10);
-        const threshold = Number.isFinite(n) ? n : 1;
-        uiModel = JSON.stringify({ operator:"greaterThan", value:{ left:"_experience.decisioning.decisionitem.itemPriority", right: threshold } });
-      }
+      const { uiModel, warning } = pqlToUiModel(filter_expression, cfg.TENANT_ID);
 
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `COLLECTION TO CREATE:
   Name       : ${name}
   Description: ${description || "(none)"}
-  Filter     : ${filter_type}${filter_value ? ` = "${filter_value}"` : ""}
+  Filter     : ${filter_expression}
   Catalog    : ${cfg.ITEM_CATALOG_ID}
   Sandbox    : ${cfg.SANDBOX_NAME}
-
+${warning ? `\n⚠️  ${warning}\n` : ""}
 This will POST to /item-collections.`);
       if (check) return check;
 
@@ -663,36 +1579,44 @@ This will POST to /item-collections.`);
 `✅ Collection created
 Name   : ${name}
 ID     : ${res.body.id}
-Filter : ${filter_type}${filter_value ? ` = "${filter_value}"` : ""}
+Filter : ${filter_expression}${warning ? `\n⚠️  ${warning}` : ""}
 💡 Save this ID: ${res.body.id}` }] };
     })
   );
 
   // ════════ TOOL 5 — create_eligibility_rule ═══════════════════════════════════
   server.tool("create_eligibility_rule",
-    "Create a PQL eligibility rule for Experience Decisioning. Requires confirmed: true to execute.",
+    "Create a PQL eligibility rule for Experience Decisioning. Also builds and attaches a segmentModel so the rule opens correctly in AJO's Rule Builder UI (not just via API). Requires confirmed: true to execute.",
     {
-      name:           z.string().describe("Rule display name"),
-      description:    z.string().default(""),
-      pql_expression: z.string().describe("PQL expression e.g. profile.loyaltyTier.in([\"gold\",\"platinum\"]) or true for all visitors"),
-      confirmed:      boolish(),
-      access_token:   z.string().optional(),
+      name:            z.string().describe("Rule display name"),
+      description:     z.string().default(""),
+      pql_expression:  z.string().describe("PQL expression e.g. profile.loyaltyTier.in([\"gold\",\"platinum\"]) or true for all visitors"),
+      merge_policy_id: z.string().optional().describe("Merge policy ID for the segmentModel. Falls back to MERGE_POLICY_ID config/header if omitted."),
+      confirmed:       boolish(),
+      access_token:    z.string().optional(),
     },
-    wrap(async ({ name, description, pql_expression, confirmed, access_token }) => {
+    wrap(async ({ name, description, pql_expression, merge_policy_id, confirmed, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const check = needsConfirmation(confirmed,
+      const mergePolicyId = merge_policy_id || cfg.MERGE_POLICY_ID;
+      const { segmentModel, warning } = pqlToSegmentModel({ pql: pql_expression, name, description, mergePolicyId });
+
+      const check = await needsConfirmation(server, confirmed,
 `ELIGIBILITY RULE TO CREATE:
   Name    : ${name}
   PQL     : ${pql_expression}
   Sandbox : ${cfg.SANDBOX_NAME}
 
+A matching segmentModel will also be included so this rule opens correctly in AJO's Rule Builder UI (mergePolicyId: ${mergePolicyId || "none set — UI may prompt for one"}).
+${warning ? `\n⚠️  ${warning}\n` : ""}
 This will POST to /offer-rules.`);
       if (check) return check;
 
       const res = await apiCall(
         `${DEFAULTS.BASE_DPS_URL}/offer-rules`, "POST",
         dpsHeaders(token, cfg),
-        { name, description, exdRule: true, condition:{ type:"PQL", format:"pql/text", value:pql_expression } }
+        { name, description, exdRule: true,
+          condition: { type: "PQL", format: "pql/text", value: pql_expression },
+          segmentModel }
       );
       if (!res.ok)
         return { content: [{ type: "text", text: `❌ Rule creation failed (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
@@ -701,6 +1625,7 @@ This will POST to /offer-rules.`);
 Name : ${name}
 ID   : ${res.body.id}
 PQL  : ${pql_expression}
+segmentModel attached: yes${warning ? ` (⚠️  ${warning})` : ""}
 💡 Save this ID: ${res.body.id}` }] };
     })
   );
@@ -729,13 +1654,17 @@ PQL  : ${pql_expression}
       else
         pql = custom_pql || "1";
 
-      const check = needsConfirmation(confirmed,
+      const { uiModel, warning } = pqlToRankingUiModel(pql);
+
+      const check = await needsConfirmation(server, confirmed,
 `RANKING FORMULA TO CREATE:
   Name    : ${name}
   Type    : ${formula_type}
   PQL     : ${pql}
   Sandbox : ${cfg.SANDBOX_NAME}
 
+uiModel : ${uiModel ? "will be attached so this formula opens correctly in AJO's visual Ranking Builder" : "not generated — formula will still work via PQL, but may open blank/manual-entry in AJO's visual Ranking Builder"}
+${warning ? `\n⚠️  ${warning}\n` : ""}
 This will POST to /ranking-formulas.`);
       if (check) return check;
 
@@ -747,6 +1676,7 @@ This will POST to /ranking-formulas.`);
           returnType: { type:"integer" },
           expression: { type:"PQL", format:"pql/text", value:pql },
           definedOn:  { offer:{ schema:{ altId:"_experience.offer-management.personalized-offer", version:"0" } } },
+          ...(uiModel ? { uiModel } : {}),
         }
       );
       if (!res.ok)
@@ -756,6 +1686,7 @@ This will POST to /ranking-formulas.`);
 Name : ${name}
 ID   : ${res.body.id}
 PQL  : ${pql}
+uiModel attached: ${uiModel ? "yes" : "no"}${warning ? ` (⚠️  ${warning})` : ""}
 💡 Save this ID: ${res.body.id}` }] };
     })
   );
@@ -775,7 +1706,7 @@ PQL  : ${pql}
     },
     wrap(async ({ name, description, collection_id, eligibility_rule_id, ranking_formula_id, priority, confirmed, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `SELECTION STRATEGY TO CREATE:
   Name        : ${name}
   Collection  : ${collection_id}
@@ -792,10 +1723,6 @@ This will POST to /selection-strategies.`);
         dpsHeaders(token, cfg),
         {
           name, description,
-          // orderEvaluationType matrix (from Adobe DPS validation):
-          //   static           → use itemPriority
-          //   scoringFunction  → PQL-based ranking function; field name is `function` (not scoringFunction/rankingStrategy)
-          //   rankingStrategy  → AI-model ranking (Sensei) — not exposed by this tool yet
           rank: ranking_formula_id
             ? { priority, order:{ orderEvaluationType:"scoringFunction", function:ranking_formula_id } }
             : { priority, order:{ orderEvaluationType:"static" } },
@@ -837,7 +1764,7 @@ Ranking     : ${ranking_formula_id  || "Static priority"}
     },
     wrap(async ({ name, description, channel, status, confirmed, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `PLACEMENT TO CREATE:
   Name    : ${name}
   Channel : ${channel}
@@ -865,14 +1792,16 @@ Status  : ${status}` }] };
 
   // ════════ TOOL 9 — get_offer_item ════════════════════════════════════════════
   server.tool("get_offer_item",
-    "Look up a single offer item by its DPS ID. Read-only.",
+    "Look up a single offer item by its DPS ID or exact offer name. Read-only.",
     {
-      offer_id:     z.string(),
+      offer_id:     z.string().describe("Offer item ID or exact offer name. A name matching more than one offer fails with an error listing the matches."),
       access_token: z.string().optional(),
     },
     wrap(async ({ offer_id, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${offer_id}`, "GET", offerItemHeaders(token, cfg));
+      const resolve = await resolveOfferIdentifiers([offer_id], token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${resolve.ids[0]}`, "GET", offerItemHeaders(token, cfg));
       return { content: [{ type: "text", text: res.ok
         ? JSON.stringify(res.body, null, 2)
         : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
@@ -919,7 +1848,7 @@ ${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""
   server.tool("update_offer_item",
     "Update fields on an existing offer item using JSON Patch operations. Requires confirmed: true to execute.",
     {
-      offer_id:     z.string(),
+      offer_id:     z.string().describe("Offer item ID or exact offer name."),
       patches:      z.array(z.object({
         op:    z.enum(["replace","add","remove"]),
         path:  z.string(),
@@ -930,23 +1859,27 @@ ${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""
     },
     wrap(async ({ offer_id, patches, confirmed, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const check = needsConfirmation(confirmed,
+      const offerResolve = await resolveOfferIdentifiers([offer_id], token, cfg);
+      if (offerResolve.error) return { content: [{ type: "text", text: `❌ ${offerResolve.error}` }] };
+      const resolvedId = offerResolve.ids[0];
+
+      const check = await needsConfirmation(server, confirmed,
 `OFFER ITEM TO UPDATE:
-  Offer ID : ${offer_id}
+  Offer ID : ${resolvedId}${offer_id !== resolvedId ? ` (resolved from "${offer_id}")` : ""}
   Sandbox  : ${cfg.SANDBOX_NAME}
 
 PATCHES TO APPLY:
 ${patches.map(p => `  ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}
 
-This will PATCH /offer-items/${offer_id}.`);
+This will PATCH /offer-items/${resolvedId}.`);
       if (check) return check;
 
       const res = await apiCall(
-        `${DEFAULTS.BASE_DPS_URL}/offer-items/${offer_id}`, "PATCH",
+        `${DEFAULTS.BASE_DPS_URL}/offer-items/${resolvedId}`, "PATCH",
         offerItemHeaders(token, cfg), patches
       );
       return { content: [{ type: "text", text: res.ok
-        ? `✅ Offer ${offer_id} updated successfully`
+        ? `✅ Offer ${resolvedId} updated successfully`
         : `❌ Update failed (${res.status}): ${JSON.stringify(res.body)}` }] };
     })
   );
@@ -968,7 +1901,7 @@ This will PATCH /offer-items/${offer_id}.`);
       const { cfg, token } = await requireApiConfig({ access_token });
       const xdmTypeMap = { string:"string", integer:"int", number:"double", boolean:"boolean" };
 
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `SCHEMA FIELD TO ADD:
   Fieldgroup    : ${fieldgroup_id}
   Field name    : _${cfg.TENANT_ID}.${field_name}
@@ -1008,7 +1941,7 @@ This will PATCH /tenant/fieldgroups/${fieldgroup_id}.`);
       const { cfg, token } = await requireApiConfig({ access_token });
       const path = `/definitions/${definition_key}/properties/_${cfg.TENANT_ID}/properties/${field_name}/meta:status`;
 
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `FIELD TO DEPRECATE:
   Fieldgroup : ${fieldgroup_id}
   Field      : _${cfg.TENANT_ID}.${field_name}
@@ -1050,7 +1983,7 @@ Status     : deprecated` }] };
     },
     wrap(async ({ field_path, confirmed, access_token }) => {
       const { cfg, token } = await requireApiConfig({ access_token });
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `OOB FIELD TO DEPRECATE VIA DESCRIPTOR:
   Schema     : ${cfg.DECISIONING_SCHEMA_URI}
   Field path : ${field_path}
@@ -1158,7 +2091,7 @@ ${extends_.map((e,i) => `  [${i}] ${e}`).join("\n") || "  (empty)"}
         ...extendsIndices.map(i => `  REMOVE meta:extends[${i}] → "${extends_[i]}"`),
       ].join("\n");
 
-      const check = needsConfirmation(confirmed,
+      const check = await needsConfirmation(server, confirmed,
 `FIELDGROUP TO DETACH:
   URI     : ${fgUri}
   Schema  : ${cfg.DECISIONING_SCHEMA_ALT_ID}
@@ -1589,6 +2522,968 @@ Schema : ${cfg.DECISIONING_SCHEMA_URI}
 Total  : ${items.length} descriptor(s)
 
 ${sections.join("\n\n")}` }] };
+    })
+  );
+
+  // ════════ TOOL 22 — update_collection ════════════════════════════════════════
+  server.tool("update_collection",
+    "Update an existing item collection using JSON Patch operations. Pass filter_expression to regenerate the constraint (supports the same operators and multi-condition and/or as create_collection) instead of hand-writing a /constraints patch. Requires confirmed: true to execute.",
+    {
+      collection_id: z.string().describe("Collection ID or exact collection name e.g. dps:item-collection:xxxxx"),
+      patches: z.array(z.object({
+        op:    z.enum(["replace","add","remove"]),
+        path:  z.string(),
+        value: z.any().optional(),
+      })).default([]).describe("JSON Patch operations. Common paths: /name, /description. Don't hand-write /constraints — use filter_expression instead."),
+      filter_expression: z.string().optional().describe(`New filter to replace the collection's constraint, e.g. 'category.equals("Skincare")' or 'category.contains("Skin") or itemPriority.greaterThan(3)', or "all".`),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ collection_id, patches, filter_expression, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const resolve = await resolveCollectionIdentifier(collection_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      let finalPatches = patches;
+      let filterNote = "No change to the filter constraint.";
+      let warning = null;
+
+      if (filter_expression) {
+        const current = resolve.body ? { ok: true, body: resolve.body } : await apiCall(`${DEFAULTS.BASE_DPS_URL}/item-collections/${resolvedId}`, "GET", dpsHeaders(token, cfg));
+        if (!current.ok)
+          return { content: [{ type: "text", text: `❌ Could not fetch current collection ${resolvedId} to rebuild its constraint (${current.status}): ${JSON.stringify(current.body)}` }] };
+
+        const itemCatalogId = current.body.constraints?.[0]?.itemCatalogId || cfg.ITEM_CATALOG_ID;
+        const built = pqlToUiModel(filter_expression, cfg.TENANT_ID);
+        warning = built.warning;
+        finalPatches = [
+          ...patches,
+          { op: current.body.constraints?.length ? "replace" : "add", path: "/constraints",
+            value: [{ itemCatalogId, uiModel: built.uiModel }] },
+        ];
+        filterNote = `Filter will be replaced with: ${filter_expression}`;
+      }
+
+      const check = await needsConfirmation(server, confirmed,
+`COLLECTION TO UPDATE:
+  Collection ID : ${resolvedId}${collection_id !== resolvedId ? ` (resolved from "${collection_id}")` : ""}
+  Sandbox       : ${cfg.SANDBOX_NAME}
+
+PATCHES TO APPLY:
+${finalPatches.map(p => `  ${p.op} ${p.path}${p.value !== undefined ? ` = ${p.path === "/constraints" ? "[regenerated constraint — see note below]" : JSON.stringify(p.value)}` : ""}`).join("\n") || "  (none)"}
+
+${filterNote}
+${warning ? `\n⚠️  ${warning}\n` : ""}
+This will PATCH /item-collections/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/item-collections/${resolvedId}`, "PATCH",
+        dpsHeaders(token, cfg), finalPatches
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Collection ${resolvedId} updated successfully\netag: ${res.body.etag || "?"}\n${filterNote}${warning ? `\n⚠️  ${warning}` : ""}`
+        : `❌ Update failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 23 — update_eligibility_rule ══════════════════════════════════
+  server.tool("update_eligibility_rule",
+    "Update an existing eligibility rule using JSON Patch operations. If /condition, /name, or /description change, also regenerates segmentModel to match, so the rule stays correctly rendered in AJO's Rule Builder UI. Requires confirmed: true to execute.",
+    {
+      rule_id: z.string().describe("Eligibility rule ID or exact rule name e.g. dps:eligibility-rule:xxxxx"),
+      patches: z.array(z.object({
+        op:    z.enum(["replace","add","remove"]),
+        path:  z.string(),
+        value: z.any().optional(),
+      })).describe("JSON Patch operations. Common paths: /name, /description, /condition. Do not pass your own /segmentModel patch — it's derived automatically from the final condition/name/description."),
+      merge_policy_id: z.string().optional().describe("Override mergePolicyId in the regenerated segmentModel. Defaults to the rule's existing mergePolicyId, then MERGE_POLICY_ID config/header."),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ rule_id, patches, merge_policy_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const resolve = await resolveEligibilityRuleIdentifier(rule_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      // Fetch current state so segmentModel can be regenerated even when a
+      // patch only touches /name or /description without also touching
+      // /condition (segmentModel embeds name/description too).
+      const current = resolve.body ? { ok: true, body: resolve.body } : await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules/${resolvedId}`, "GET", dpsHeaders(token, cfg));
+      if (!current.ok)
+        return { content: [{ type: "text", text: `❌ Could not fetch current rule ${resolvedId} to regenerate segmentModel (${current.status}): ${JSON.stringify(current.body)}` }] };
+
+      const touchesRelevantField = patches.some(p => ["/condition","/condition/value","/name","/description"].includes(p.path));
+      const callerSuppliedSegmentModel = patches.some(p => p.path === "/segmentModel" || p.path.startsWith("/segmentModel/"));
+
+      let finalPatches = patches;
+      let segmentModelNote = "No changes to /condition, /name, or /description — segmentModel left as-is.";
+      let warning = null;
+
+      if (touchesRelevantField && !callerSuppliedSegmentModel) {
+        const nameP  = patches.find(p => p.path === "/name");
+        const descP  = patches.find(p => p.path === "/description");
+        const condP  = patches.find(p => p.path === "/condition" || p.path === "/condition/value");
+
+        if (condP && condP.op === "remove") {
+          // Condition is being removed entirely — there's no PQL left to derive
+          // a segmentModel from, so drop segmentModel too instead of building one
+          // from missing data.
+          finalPatches = current.body.segmentModel
+            ? [...patches, { op: "remove", path: "/segmentModel" }]
+            : patches;
+          segmentModelNote = current.body.segmentModel
+            ? "condition removed — segmentModel removed as well (no PQL left to derive it from)."
+            : "condition removed — no segmentModel existed to remove.";
+        } else {
+          const finalName  = nameP && nameP.op !== "remove" ? nameP.value : current.body.name;
+          const finalDesc  = descP && descP.op !== "remove" ? descP.value : current.body.description;
+          const finalPql   = condP
+            ? (condP.path === "/condition" ? condP.value?.value : condP.value)
+            : current.body.condition?.value;
+
+          const mergePolicyId = merge_policy_id || current.body.segmentModel?.mergePolicyId || cfg.MERGE_POLICY_ID;
+          const built = pqlToSegmentModel({ pql: finalPql, name: finalName, description: finalDesc, mergePolicyId });
+          warning = built.warning;
+
+          finalPatches = [
+            ...patches,
+            { op: current.body.segmentModel ? "replace" : "add", path: "/segmentModel", value: built.segmentModel },
+          ];
+          segmentModelNote = `segmentModel will be regenerated to match (mergePolicyId: ${mergePolicyId || "none set — UI may prompt for one"}).`;
+        }
+      } else if (callerSuppliedSegmentModel) {
+        segmentModelNote = "Caller supplied an explicit /segmentModel patch — using it as-is, not auto-regenerating.";
+      }
+
+      const check = await needsConfirmation(server, confirmed,
+`ELIGIBILITY RULE TO UPDATE:
+  Rule ID : ${resolvedId}${rule_id !== resolvedId ? ` (resolved from "${rule_id}")` : ""}
+  Sandbox : ${cfg.SANDBOX_NAME}
+
+PATCHES TO APPLY:
+${finalPatches.map(p => `  ${p.op} ${p.path}${p.value !== undefined ? ` = ${p.path === "/segmentModel" ? "[regenerated segmentModel — see note below]" : JSON.stringify(p.value)}` : ""}`).join("\n")}
+
+${segmentModelNote}
+${warning ? `\n⚠️  ${warning}\n` : ""}
+This will PATCH /offer-rules/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/offer-rules/${resolvedId}`, "PATCH",
+        dpsHeaders(token, cfg), finalPatches
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Eligibility rule ${resolvedId} updated successfully\netag: ${res.body.etag || "?"}\n${segmentModelNote}${warning ? `\n⚠️  ${warning}` : ""}`
+        : `❌ Update failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 24 — update_ranking_formula ═══════════════════════════════════
+  server.tool("update_ranking_formula",
+    "Update an existing ranking formula using JSON Patch operations. If /expression changes, also regenerates uiModel to match, so the formula stays correctly rendered in AJO's visual Ranking Builder. Requires confirmed: true to execute.",
+    {
+      formula_id: z.string().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx"),
+      patches: z.array(z.object({
+        op:    z.enum(["replace","add","remove"]),
+        path:  z.string(),
+        value: z.any().optional(),
+      })).describe("JSON Patch operations. Common paths: /name, /description, /expression, /definedOn. Do not pass your own /uiModel patch — it's derived automatically from the final expression."),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ formula_id, patches, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const resolve = await resolveRankingFormulaIdentifier(formula_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const exprP = patches.find(p => p.path === "/expression" || p.path === "/expression/value");
+      const callerSuppliedUiModel = patches.some(p => p.path === "/uiModel" || p.path.startsWith("/uiModel/"));
+
+      let finalPatches = patches;
+      let uiModelNote = "No change to /expression — uiModel left as-is.";
+      let warning = null;
+
+      if (exprP && !callerSuppliedUiModel) {
+        // Fetch current state so we know whether uiModel already exists (add
+        // vs replace) and can drop it cleanly if the new expression can't be
+        // translated.
+        const current = resolve.body ? { ok: true, body: resolve.body } : await apiCall(`${DEFAULTS.BASE_DPS_URL}/ranking-formulas/${resolvedId}`, "GET", dpsHeaders(token, cfg));
+        if (!current.ok)
+          return { content: [{ type: "text", text: `❌ Could not fetch current ranking formula ${resolvedId} to regenerate uiModel (${current.status}): ${JSON.stringify(current.body)}` }] };
+
+        if (exprP.op === "remove") {
+          finalPatches = current.body.uiModel
+            ? [...patches, { op: "remove", path: "/uiModel" }]
+            : patches;
+          uiModelNote = current.body.uiModel
+            ? "expression removed — uiModel removed as well (no PQL left to derive it from)."
+            : "expression removed — no uiModel existed to remove.";
+        } else {
+          const newPql = exprP.path === "/expression" ? exprP.value?.value : exprP.value;
+          const built = pqlToRankingUiModel(newPql);
+          warning = built.warning;
+          if (built.uiModel) {
+            finalPatches = [
+              ...patches,
+              { op: current.body.uiModel ? "replace" : "add", path: "/uiModel", value: built.uiModel },
+            ];
+            uiModelNote = "uiModel will be regenerated to match the new expression.";
+          } else if (current.body.uiModel) {
+            finalPatches = [...patches, { op: "remove", path: "/uiModel" }];
+            uiModelNote = "New expression isn't a simple if/else chain — stale uiModel removed rather than left mismatched.";
+          } else {
+            uiModelNote = "New expression isn't a simple if/else chain — no uiModel generated (formula still works via PQL).";
+          }
+        }
+      } else if (callerSuppliedUiModel) {
+        uiModelNote = "Caller supplied an explicit /uiModel patch — using it as-is, not auto-regenerating.";
+      }
+
+      const check = await needsConfirmation(server, confirmed,
+`RANKING FORMULA TO UPDATE:
+  Formula ID : ${resolvedId}${formula_id !== resolvedId ? ` (resolved from "${formula_id}")` : ""}
+  Sandbox    : ${cfg.SANDBOX_NAME}
+
+PATCHES TO APPLY:
+${finalPatches.map(p => `  ${p.op} ${p.path}${p.value !== undefined ? ` = ${p.path === "/uiModel" ? "[regenerated uiModel — see note below]" : JSON.stringify(p.value)}` : ""}`).join("\n")}
+
+${uiModelNote}
+${warning ? `\n⚠️  ${warning}\n` : ""}
+This will PATCH /ranking-formulas/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/ranking-formulas/${resolvedId}`, "PATCH",
+        dpsHeaders(token, cfg), finalPatches
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Ranking formula ${resolvedId} updated successfully\netag: ${res.body.etag || "?"}\n${uiModelNote}${warning ? `\n⚠️  ${warning}` : ""}`
+        : `❌ Update failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 25 — update_selection_strategy ════════════════════════════════
+  server.tool("update_selection_strategy",
+    "Update an existing selection strategy using JSON Patch operations. Requires confirmed: true to execute.",
+    {
+      strategy_id: z.string().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx"),
+      patches: z.array(z.object({
+        op:    z.enum(["replace","add","remove"]),
+        path:  z.string(),
+        value: z.any().optional(),
+      })).describe("JSON Patch operations. Common paths: /name, /description, /rank, /profileConstraint, /optionSelection"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ strategy_id, patches, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveSelectionStrategyIdentifier(strategy_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const check = await needsConfirmation(server, confirmed,
+`SELECTION STRATEGY TO UPDATE:
+  Strategy ID : ${resolvedId}${strategy_id !== resolvedId ? ` (resolved from "${strategy_id}")` : ""}
+  Sandbox     : ${cfg.SANDBOX_NAME}
+
+PATCHES TO APPLY:
+${patches.map(p => `  ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}
+
+This will PATCH /selection-strategies/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/selection-strategies/${resolvedId}`, "PATCH",
+        dpsHeaders(token, cfg), patches
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Selection strategy ${resolvedId} updated successfully\netag: ${res.body.etag || "?"}`
+        : `❌ Update failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 26 — update_placement ═════════════════════════════════════════
+  server.tool("update_placement",
+    "Update an existing ExD placement using PUT (full replace). Placements use PUT not PATCH per the DPS API. Requires confirmed: true to execute.",
+    {
+      placement_id: z.string().describe("Placement ID or exact placement name e.g. dps:exd-placement:xxxxx"),
+      name:         z.string().optional().describe("New display name"),
+      description:  z.string().optional().describe("New description"),
+      status:       z.enum(["active","archived"]).optional().describe("New status"),
+      channel:      z.string().optional().describe("Channel URI e.g. https://ns.adobe.com/xdm/channel-types/web"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ placement_id, name, description, status, channel, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const resolve = await resolvePlacementIdentifier(placement_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      // Fetch current placement to merge fields (PUT requires full body)
+      const getRes = resolve.body ? { ok: true, body: resolve.body } : await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/exd-placements/${resolvedId}`, "GET",
+        placementHeaders(token, cfg)
+      );
+      if (!getRes.ok)
+        return { content: [{ type: "text", text: `❌ Could not fetch placement for update (${getRes.status}): ${JSON.stringify(getRes.body)}` }] };
+
+      const current = getRes.body;
+      const payload = {
+        id:          resolvedId,
+        name:        name        ?? current.name,
+        description: description ?? current.description ?? "",
+        status:      status      ?? current.status,
+        channel:     channel     ?? current.channel,
+      };
+
+      const check = await needsConfirmation(server, confirmed,
+`PLACEMENT TO UPDATE (PUT — full replace):
+  Placement ID : ${resolvedId}${placement_id !== resolvedId ? ` (resolved from "${placement_id}")` : ""}
+  Sandbox      : ${cfg.SANDBOX_NAME}
+
+NEW VALUES:
+  name        : ${payload.name}
+  description : ${payload.description}
+  status      : ${payload.status}
+  channel     : ${payload.channel}
+
+This will PUT /exd-placements/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/exd-placements/${resolvedId}`, "PUT",
+        placementHeaders(token, cfg), payload
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ Update failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+
+      // The PUT response doesn't echo back the stored object, and this endpoint
+      // has been observed to silently ignore a /name change (200 OK, etag bumps,
+      // but the name is left untouched) — so verify what was actually persisted
+      // rather than trusting the request payload.
+      const verifyRes = await apiCall(`${DEFAULTS.BASE_DPS_URL}/exd-placements/${resolvedId}`, "GET", placementHeaders(token, cfg));
+      const persisted = verifyRes.ok ? verifyRes.body : null;
+      const nameMismatch = persisted && persisted.name !== payload.name;
+
+      return { content: [{ type: "text", text:
+`✅ Placement ${resolvedId} updated successfully
+Name   : ${persisted?.name ?? payload.name}
+Status : ${persisted?.status ?? payload.status}
+${nameMismatch ? `\n⚠️  Requested name "${payload.name}" was not persisted by the API — placement name appears immutable after creation on this endpoint. Current name is still "${persisted.name}".` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 27 — get_collection ═══════════════════════════════════════════
+  server.tool("get_collection",
+    "Look up a single item collection by its DPS ID or exact collection name. Read-only.",
+    {
+      collection_id: z.string().describe("Collection ID or exact collection name e.g. dps:item-collection:xxxxx. A name matching more than one collection fails with an error listing the matches."),
+      access_token:  z.string().optional(),
+    },
+    wrap(async ({ collection_id, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveCollectionIdentifier(collection_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/item-collections/${resolve.id}`, "GET", dpsHeaders(token, cfg));
+      return { content: [{ type: "text", text: res.ok
+        ? JSON.stringify(res.body, null, 2)
+        : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 28 — list_collections ═════════════════════════════════════════
+  server.tool("list_collections",
+    "List all item collections in the sandbox with pagination. Read-only.",
+    {
+      limit:        z.number().default(20),
+      offset:       z.number().default(0),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ limit, offset, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/item-collections?limit=${limit}&offset=${offset}`, "GET",
+        dpsHeaders(token, cfg)
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+
+      const items = extractItems(res.body);
+      if (!items.length)
+        return { content: [{ type: "text", text:
+`⚠️ 0 items returned.
+Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
+Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
+
+      return { content: [{ type: "text", text:
+`📋 Collections (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
+${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 29 — delete_collection ════════════════════════════════════════
+  server.tool("delete_collection",
+    "Permanently delete an item collection. Requires confirmed: true to execute. This cannot be undone — any selection strategy still referencing this collection will break.",
+    {
+      collection_id: z.string().describe("Collection ID or exact collection name e.g. dps:item-collection:xxxxx"),
+      confirmed:     boolish(),
+      access_token:  z.string().optional(),
+    },
+    wrap(async ({ collection_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveCollectionIdentifier(collection_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const check = await needsConfirmation(server, confirmed,
+`COLLECTION TO DELETE:
+  Collection ID : ${resolvedId}${collection_id !== resolvedId ? ` (resolved from "${collection_id}")` : ""}
+  Sandbox       : ${cfg.SANDBOX_NAME}
+
+⚠️  This cannot be undone. Any selection strategy referencing this collection will break.
+
+This will DELETE /item-collections/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/item-collections/${resolvedId}`, "DELETE",
+        dpsHeaders(token, cfg)
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Collection ${resolvedId} deleted successfully`
+        : `❌ Delete failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 30 — get_eligibility_rule ═════════════════════════════════════
+  server.tool("get_eligibility_rule",
+    "Look up a single eligibility rule by its DPS ID or exact rule name. Read-only.",
+    {
+      rule_id:      z.string().describe("Eligibility rule ID or exact rule name e.g. dps:eligibility-rule:xxxxx. A name matching more than one rule fails with an error listing the matches."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ rule_id, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveEligibilityRuleIdentifier(rule_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules/${resolve.id}`, "GET", dpsHeaders(token, cfg));
+      return { content: [{ type: "text", text: res.ok
+        ? JSON.stringify(res.body, null, 2)
+        : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 31 — list_eligibility_rules ═══════════════════════════════════
+  server.tool("list_eligibility_rules",
+    "List all ExD eligibility rules in the sandbox with pagination. Read-only. Filters to exdRule==true so unrelated offer-rules aren't included.",
+    {
+      limit:        z.number().default(20),
+      offset:       z.number().default(0),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ limit, offset, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/offer-rules?property=exdRule%3D%3Dtrue&limit=${limit}&offset=${offset}`, "GET",
+        dpsHeaders(token, cfg)
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+
+      const items = extractItems(res.body);
+      if (!items.length)
+        return { content: [{ type: "text", text:
+`⚠️ 0 items returned.
+Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
+Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
+
+      return { content: [{ type: "text", text:
+`📋 Eligibility rules (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
+${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 32 — delete_eligibility_rule ══════════════════════════════════
+  server.tool("delete_eligibility_rule",
+    "Permanently delete an eligibility rule. Requires confirmed: true to execute. This cannot be undone — any selection strategy still referencing this rule will break.",
+    {
+      rule_id:      z.string().describe("Eligibility rule ID or exact rule name e.g. dps:eligibility-rule:xxxxx"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ rule_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveEligibilityRuleIdentifier(rule_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const check = await needsConfirmation(server, confirmed,
+`ELIGIBILITY RULE TO DELETE:
+  Rule ID : ${resolvedId}${rule_id !== resolvedId ? ` (resolved from "${rule_id}")` : ""}
+  Sandbox : ${cfg.SANDBOX_NAME}
+
+⚠️  This cannot be undone. Any selection strategy referencing this rule will break.
+
+This will DELETE /offer-rules/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/offer-rules/${resolvedId}`, "DELETE",
+        dpsHeaders(token, cfg)
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Eligibility rule ${resolvedId} deleted successfully`
+        : `❌ Delete failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 33 — get_ranking_formula ══════════════════════════════════════
+  server.tool("get_ranking_formula",
+    "Look up a single ranking formula by its DPS ID or exact formula name. Read-only.",
+    {
+      formula_id:   z.string().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx. A name matching more than one formula fails with an error listing the matches."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ formula_id, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveRankingFormulaIdentifier(formula_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/ranking-formulas/${resolve.id}`, "GET", dpsHeaders(token, cfg));
+      return { content: [{ type: "text", text: res.ok
+        ? JSON.stringify(res.body, null, 2)
+        : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 34 — list_ranking_formulas ════════════════════════════════════
+  server.tool("list_ranking_formulas",
+    "List all ExD ranking formulas in the sandbox with pagination. Read-only. Filters to exdFunction==true so unrelated ranking-formulas aren't included.",
+    {
+      limit:        z.number().default(20),
+      offset:       z.number().default(0),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ limit, offset, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/ranking-formulas?property=exdFunction%3D%3Dtrue&limit=${limit}&offset=${offset}`, "GET",
+        dpsHeaders(token, cfg)
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+
+      const items = extractItems(res.body);
+      if (!items.length)
+        return { content: [{ type: "text", text:
+`⚠️ 0 items returned.
+Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
+Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
+
+      return { content: [{ type: "text", text:
+`📋 Ranking formulas (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
+${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 35 — delete_ranking_formula ═══════════════════════════════════
+  server.tool("delete_ranking_formula",
+    "Permanently delete a ranking formula. Requires confirmed: true to execute. This cannot be undone — any selection strategy still referencing this formula will break.",
+    {
+      formula_id:   z.string().describe("Ranking formula ID or exact formula name e.g. dps:ranking-function:xxxxx"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ formula_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveRankingFormulaIdentifier(formula_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const check = await needsConfirmation(server, confirmed,
+`RANKING FORMULA TO DELETE:
+  Formula ID : ${resolvedId}${formula_id !== resolvedId ? ` (resolved from "${formula_id}")` : ""}
+  Sandbox    : ${cfg.SANDBOX_NAME}
+
+⚠️  This cannot be undone. Any selection strategy referencing this formula will break.
+
+This will DELETE /ranking-formulas/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/ranking-formulas/${resolvedId}`, "DELETE",
+        dpsHeaders(token, cfg)
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Ranking formula ${resolvedId} deleted successfully`
+        : `❌ Delete failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 36 — get_selection_strategy ═══════════════════════════════════
+  server.tool("get_selection_strategy",
+    "Look up a single selection strategy by its DPS ID or exact strategy name. Read-only.",
+    {
+      strategy_id:  z.string().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx. A name matching more than one strategy fails with an error listing the matches."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ strategy_id, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveSelectionStrategyIdentifier(strategy_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/selection-strategies/${resolve.id}`, "GET", dpsHeaders(token, cfg));
+      return { content: [{ type: "text", text: res.ok
+        ? JSON.stringify(res.body, null, 2)
+        : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 37 — list_selection_strategies ════════════════════════════════
+  server.tool("list_selection_strategies",
+    "List all selection strategies in the sandbox with pagination. Read-only.",
+    {
+      limit:        z.number().default(20),
+      offset:       z.number().default(0),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ limit, offset, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/selection-strategies?limit=${limit}&offset=${offset}`, "GET",
+        dpsHeaders(token, cfg)
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+
+      const items = extractItems(res.body);
+      if (!items.length)
+        return { content: [{ type: "text", text:
+`⚠️ 0 items returned.
+Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
+Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
+
+      return { content: [{ type: "text", text:
+`📋 Selection strategies (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(i => `  • ${i.name || "unnamed"} | ID: ${i.id || "?"}`).join("\n")}
+${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 38 — delete_selection_strategy ════════════════════════════════
+  server.tool("delete_selection_strategy",
+    "Permanently delete a selection strategy. Requires confirmed: true to execute. This cannot be undone — any placement or journey still referencing this strategy will break.",
+    {
+      strategy_id:  z.string().describe("Selection strategy ID or exact strategy name e.g. dps:selection-strategy:xxxxx"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ strategy_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolveSelectionStrategyIdentifier(strategy_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const check = await needsConfirmation(server, confirmed,
+`SELECTION STRATEGY TO DELETE:
+  Strategy ID : ${resolvedId}${strategy_id !== resolvedId ? ` (resolved from "${strategy_id}")` : ""}
+  Sandbox     : ${cfg.SANDBOX_NAME}
+
+⚠️  This cannot be undone. Any placement or journey referencing this strategy will break.
+
+This will DELETE /selection-strategies/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/selection-strategies/${resolvedId}`, "DELETE",
+        dpsHeaders(token, cfg)
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Selection strategy ${resolvedId} deleted successfully`
+        : `❌ Delete failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 39 — get_placement ═════════════════════════════════════════════
+  server.tool("get_placement",
+    "Look up a single ExD channel placement by its DPS ID or exact placement name. Read-only.",
+    {
+      placement_id: z.string().describe("Placement ID or exact placement name e.g. dps:exd-placement:xxxxx. A name matching more than one placement fails with an error listing the matches."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ placement_id, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolvePlacementIdentifier(placement_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      if (resolve.body) return { content: [{ type: "text", text: JSON.stringify(resolve.body, null, 2) }] };
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/exd-placements/${resolve.id}`, "GET", placementHeaders(token, cfg));
+      return { content: [{ type: "text", text: res.ok
+        ? JSON.stringify(res.body, null, 2)
+        : `❌ (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 40 — delete_offer_item ════════════════════════════════════════
+  server.tool("delete_offer_item",
+    "Permanently delete an offer item. Requires confirmed: true to execute. This cannot be undone — any collection whose filter matches this offer will simply no longer return it.",
+    {
+      offer_id:     z.string().describe("Offer item ID or exact offer name e.g. dps:<schemaHash>:xxxxx"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ offer_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const offerResolve = await resolveOfferIdentifiers([offer_id], token, cfg);
+      if (offerResolve.error) return { content: [{ type: "text", text: `❌ ${offerResolve.error}` }] };
+      const resolvedId = offerResolve.ids[0];
+
+      const check = await needsConfirmation(server, confirmed,
+`OFFER ITEM TO DELETE:
+  Offer ID : ${resolvedId}${offer_id !== resolvedId ? ` (resolved from "${offer_id}")` : ""}
+  Sandbox  : ${cfg.SANDBOX_NAME}
+
+⚠️  This cannot be undone. Prefer archiving (update_offer_item with lifecycleStatus: "archived") if you may want the offer back.
+
+This will DELETE /offer-items/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/offer-items/${resolvedId}`, "DELETE",
+        offerItemHeaders(token, cfg)
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Offer item ${resolvedId} deleted successfully`
+        : `❌ Delete failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 41 — delete_placement ═════════════════════════════════════════
+  server.tool("delete_placement",
+    "Permanently delete an ExD channel placement. Requires confirmed: true to execute. This cannot be undone — any selection strategy wired to this placement will break.",
+    {
+      placement_id: z.string().describe("Placement ID or exact placement name e.g. dps:exd-placement:xxxxx"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ placement_id, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const resolve = await resolvePlacementIdentifier(placement_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+      const resolvedId = resolve.id;
+
+      const check = await needsConfirmation(server, confirmed,
+`PLACEMENT TO DELETE:
+  Placement ID : ${resolvedId}${placement_id !== resolvedId ? ` (resolved from "${placement_id}")` : ""}
+  Sandbox      : ${cfg.SANDBOX_NAME}
+
+⚠️  This cannot be undone. Any selection strategy wired to this placement will break.
+
+This will DELETE /exd-placements/${resolvedId}.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/exd-placements/${resolvedId}`, "DELETE",
+        placementHeaders(token, cfg)
+      );
+      return { content: [{ type: "text", text: res.ok
+        ? `✅ Placement ${resolvedId} deleted successfully`
+        : `❌ Delete failed (${res.status}): ${JSON.stringify(res.body)}` }] };
+    })
+  );
+
+  // ════════ TOOL 42 — bulk_update_offers ═══════════════════════════════════════
+  server.tool("bulk_update_offers",
+    "Update multiple existing offer items in one call, each with its own JSON Patch operations. Requires confirmed: true to execute — previews all patches first. Use dry_run: true to inspect the patch payloads without calling the API.",
+    {
+      updates: z.array(z.object({
+        offer_id: z.string().describe("Offer item ID or exact offer name"),
+        patches:  z.array(z.object({
+          op:    z.enum(["replace","add","remove"]),
+          path:  z.string(),
+          value: z.any().optional(),
+        })).min(1).describe("JSON Patch operations for this offer"),
+      })).min(1).describe("One entry per offer to update"),
+      dry_run:      boolish().describe("Returns the patch payloads without calling the API. Names are shown unresolved since dry_run never makes API calls."),
+      confirmed:    boolish().describe("Set to true to execute the write. Leave false to preview."),
+      access_token: z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
+    },
+    wrap(async ({ updates, dry_run, confirmed, access_token }) => {
+      const fmtUpdate = (u, i) =>
+        `${i + 1}. ${u.offer_id}\n${u.patches.map(p => `   ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}`;
+
+      if (dry_run) return { content: [{ type: "text", text:
+`🔍 DRY RUN — ${updates.length} offer(s) would be updated:
+${updates.map(fmtUpdate).join("\n\n")}
+
+Call again with dry_run: false and confirmed: true to execute.` }] };
+
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const offerResolve = await resolveOfferIdentifiers(updates.map(u => u.offer_id), token, cfg);
+      if (offerResolve.error) return { content: [{ type: "text", text: `❌ Could not resolve offer_id(s): ${offerResolve.error}` }] };
+      const resolvedUpdates = updates.map((u, i) => ({ ...u, resolvedId: offerResolve.ids[i] }));
+      const fmtResolved = (u, i) =>
+        `${i + 1}. ${u.resolvedId}${u.offer_id !== u.resolvedId ? ` (resolved from "${u.offer_id}")` : ""}\n${u.patches.map(p => `   ${p.op} ${p.path}${p.value !== undefined ? ` = ${JSON.stringify(p.value)}` : ""}`).join("\n")}`;
+
+      const check = await needsConfirmation(server, confirmed,
+`OFFERS TO UPDATE: ${resolvedUpdates.length}
+Sandbox : ${cfg.SANDBOX_NAME}
+
+${resolvedUpdates.map(fmtResolved).join("\n\n")}
+
+This will PATCH ${resolvedUpdates.length} offer-items.`);
+      if (check) return check;
+
+      const { results, errors } = await runChunked(resolvedUpdates, async (u) => {
+        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${u.resolvedId}`, "PATCH", offerItemHeaders(token, cfg), u.patches);
+        return { id: u.resolvedId, res };
+      });
+
+      return { content: [{ type: "text", text:
+`📦 BULK OFFER UPDATE COMPLETE
+✅ Updated : ${results.length}  |  ❌ Failed: ${errors.length}
+${results.map(id => `  ✅ ${id}`).join("\n")}
+${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 43 — bulk_delete_offers ═══════════════════════════════════════
+  server.tool("bulk_delete_offers",
+    `Permanently delete multiple offer items in one call. Requires confirmed: true to execute. This cannot be undone — prefer bulk_update_offers (patch /_experience/decisioning/offeritem/lifecycleStatus to "archived") if you may want them back.`,
+    {
+      offer_ids:    z.array(z.string()).min(1).describe("Offer item IDs or exact offer names to delete"),
+      confirmed:    boolish(),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ offer_ids, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const offerResolve = await resolveOfferIdentifiers(offer_ids, token, cfg);
+      if (offerResolve.error) return { content: [{ type: "text", text: `❌ Could not resolve offer_ids: ${offerResolve.error}` }] };
+      const resolvedIds = offerResolve.ids;
+
+      const check = await needsConfirmation(server, confirmed,
+`OFFERS TO DELETE: ${resolvedIds.length}
+Sandbox : ${cfg.SANDBOX_NAME}
+
+${resolvedIds.map((id, i) => `  ${i + 1}. ${id}${offer_ids[i] !== id ? ` (resolved from "${offer_ids[i]}")` : ""}`).join("\n")}
+
+⚠️  This cannot be undone. Prefer bulk_update_offers (patch /_experience/decisioning/offeritem/lifecycleStatus to "archived") if you may want these back.
+
+This will DELETE ${resolvedIds.length} offer-items.`);
+      if (check) return check;
+
+      const { results, errors } = await runChunked(resolvedIds, async (id) => {
+        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${id}`, "DELETE", offerItemHeaders(token, cfg));
+        return { id, res };
+      });
+
+      return { content: [{ type: "text", text:
+`📦 BULK OFFER DELETE COMPLETE
+✅ Deleted : ${results.length}  |  ❌ Failed: ${errors.length}
+${results.map(id => `  ✅ ${id}`).join("\n")}
+${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 44 — attach_offer_eligibility_rule ════════════════════════════
+  server.tool("attach_offer_eligibility_rule",
+    `Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.`,
+    {
+      offer_ids:           z.array(z.string()).min(1).describe("Offer item ID(s) or exact offer name(s) to attach eligibility to, or remove it from. Names are resolved automatically; a name matching more than one offer fails with an error listing the matches so you can specify by ID instead."),
+      eligibility_rule_id: z.string().optional().describe(`Decision/eligibility rule ID or exact rule name to attach. Mutually exclusive with audience. Omit both to detach any existing offer-level eligibility (resets itemConstraints to profileConstraintType: "none"). Names are resolved automatically; an ambiguous name fails with an error listing the matches.`),
+      audience:            z.string().optional().describe(`Audience (Real-Time CDP segment) ID or exact name to restrict eligibility to. Mutually exclusive with eligibility_rule_id. Audiences are a separate resource from eligibility rules — under the hood this attaches an auto-generated eligibility rule (named "Audience: <name>", reused on repeat calls rather than duplicated) that checks segment membership.`),
+      confirmed:           boolish(),
+      access_token:        z.string().optional(),
+    },
+    wrap(async ({ offer_ids, eligibility_rule_id, audience, confirmed, access_token }) => {
+      if (eligibility_rule_id && audience)
+        return { content: [{ type: "text", text: "❌ Provide only one of eligibility_rule_id or audience, not both." }] };
+
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const offerResolve = await resolveOfferIdentifiers(offer_ids, token, cfg);
+      if (offerResolve.error)
+        return { content: [{ type: "text", text: `❌ Could not resolve offer_ids: ${offerResolve.error}` }] };
+      const resolvedOfferIds = offerResolve.ids;
+
+      let resolvedRuleId = null, ruleName = null, audienceInfo = null;
+      if (eligibility_rule_id) {
+        const ruleResolve = await resolveEligibilityRuleIdentifier(eligibility_rule_id, token, cfg);
+        if (ruleResolve.error)
+          return { content: [{ type: "text", text: `❌ Could not resolve eligibility_rule_id: ${ruleResolve.error}` }] };
+        resolvedRuleId = ruleResolve.id;
+        ruleName = ruleResolve.name;
+      } else if (audience) {
+        // Read-only lookup here only — the underlying eligibility rule (a
+        // real write) isn't created/reused until after confirmed:true below.
+        const audienceResolve = await resolveAudienceIdentifier(audience, token, cfg);
+        if (audienceResolve.error)
+          return { content: [{ type: "text", text: `❌ Could not resolve audience: ${audienceResolve.error}` }] };
+        audienceInfo = audienceResolve;
+      }
+
+      const actionLabel = resolvedRuleId
+        ? `ATTACH eligibility rule "${ruleName}" (${resolvedRuleId})`
+        : audienceInfo
+        ? `ATTACH audience "${audienceInfo.name}" (${audienceInfo.id}) — will create/reuse eligibility rule "Audience: ${audienceInfo.name}"`
+        : `DETACH any offer-level eligibility (reset to no constraint)`;
+
+      const check = await needsConfirmation(server, confirmed,
+`${actionLabel}
+Offers  : ${resolvedOfferIds.length}
+Sandbox : ${cfg.SANDBOX_NAME}
+
+${resolvedOfferIds.map((id, i) => `  ${i + 1}. ${id}${offer_ids[i] !== id ? ` (resolved from "${offer_ids[i]}")` : ""}`).join("\n")}
+
+This will PATCH ${resolvedOfferIds.length} offer-item(s)' itemConstraints.`);
+      if (check) return check;
+
+      let audienceNote = "";
+      if (audienceInfo) {
+        const ensured = await ensureAudienceEligibilityRule(audienceInfo.id, audienceInfo.name, token, cfg);
+        if (ensured.error)
+          return { content: [{ type: "text", text: `❌ Could not attach audience: ${ensured.error}` }] };
+        resolvedRuleId = ensured.id;
+        ruleName = ensured.name;
+        audienceNote = `\nEligibility rule "${ruleName}" (${resolvedRuleId}) — ${ensured.reused ? "reused existing" : "newly created"}.`;
+      }
+
+      const itemConstraints = resolvedRuleId
+        ? { profileConstraintType: "eligibilityRule", eligibilityRule: resolvedRuleId }
+        : { profileConstraintType: "none" };
+
+      const { results, errors } = await runChunked(resolvedOfferIds, async (id) => {
+        const res = await apiCall(
+          `${DEFAULTS.BASE_DPS_URL}/offer-items/${id}`, "PATCH", offerItemHeaders(token, cfg),
+          [{ op: "replace", path: "/_experience/decisioning/decisionitem/itemConstraints", value: itemConstraints }]
+        );
+        return { id, res };
+      });
+
+      return { content: [{ type: "text", text:
+`📦 ${resolvedRuleId ? "ELIGIBILITY ATTACHED" : "ELIGIBILITY DETACHED"}
+✅ Succeeded : ${results.length}  |  ❌ Failed: ${errors.length}
+${results.map(id => `  ✅ ${id}`).join("\n")}
+${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}${audienceNote}` }] };
     })
   );
 

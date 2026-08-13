@@ -8,26 +8,12 @@ AI-native Experience Decisioning lifecycle automation for Adobe Journey Optimize
 End-to-end ExD setup from a single chat conversation: CSV → schema fields → offers →
 collections → eligibility rules → ranking → selection strategy → placements.
 
-**21 MCP tools** wrapping AEP Schema Registry and Decisioning APIs. Every write
-operation previews what it will do and requires explicit `confirmed: true` before
+**44 MCP tools** wrapping AEP Schema Registry and Decisioning APIs. Every write
+operation previews what it will do and requires explicit confirmed: true before
 executing.
 
 **Live endpoint:** `https://exd-mcp-server-without-auth.vercel.app/api/mcp`
 **Health:** `https://exd-mcp-server-without-auth.vercel.app/api/health`
-
----
-
-## What's new in 2.0
-
-| Was in 1.x | Now in 2.0 |
-|---|---|
-| Manual ACCESS_TOKEN paste, expires every 24h | Auto-mints via `client_credentials`, cached per client_id |
-| Express + SSE local server, ngrok tunnel for sharing | Streamable HTTP serverless route — deploy to Vercel in one click |
-| Single hardcoded sandbox in `.env` | Per-request config via HTTP headers — every coworker uses their own sandbox |
-| README claimed 13 tools, code had 21 | 21 tools, documented |
-| Bulk offers defaulted to `2024-06-10` (past date) | Defaults to today + 1 year |
-| `lookup_decisioning_schema` showed `0 fieldgroups` on healthy schemas | Reads from `meta:extends` too — accurate counts |
-| `.gitignore` had `".env"` (quoted) — would not actually ignore | Plain `.env`, plus `.vercel/`, log files, etc. |
 
 ---
 
@@ -128,14 +114,14 @@ codebase. The transport layer is the only difference.
 
 ---
 
-## All 21 tools
+## All 44 tools
 
 ### Read-only (no confirmation needed)
 
 | # | Tool | What it does |
 |---|---|---|
 | 1 | `parse_csv_and_suggest` | Parses CSV, infers XDM types per column, suggests eligibility rules and ranking formulas. Always call first. No API calls. |
-| 9 | `get_offer_item` | Fetches a single offer item by DPS ID |
+| 9 | `get_offer_item` | Fetches a single offer item by DPS ID or exact offer name |
 | 10 | `list_offer_items` | Lists all offers in catalog with pagination |
 | 16 | `get_setup_summary` | Full inventory: offers, collections, rules, formulas, strategies, placements |
 | 17 | `lookup_decisioning_schema` | Full resolved schema with OOB + tenant fields; accepts `include_deprecated: true` |
@@ -143,23 +129,49 @@ codebase. The transport layer is the only difference.
 | 19 | `get_fieldgroup` | Full field definitions inside a specific fieldgroup |
 | 20 | `get_schema_audit_log` | Chronological change history for the decisioning schema |
 | 21 | `list_schema_descriptors` | Identity, deprecation, display name, relationship descriptors |
+| 27 | `get_collection` | Fetches a single item collection by DPS ID or exact collection name |
+| 28 | `list_collections` | Lists all item collections with pagination |
+| 30 | `get_eligibility_rule` | Fetches a single eligibility rule by DPS ID or exact rule name |
+| 31 | `list_eligibility_rules` | Lists all ExD eligibility rules with pagination (filters to exdRule==true) |
+| 33 | `get_ranking_formula` | Fetches a single ranking formula by DPS ID or exact formula name |
+| 34 | `list_ranking_formulas` | Lists all ExD ranking formulas with pagination (filters to exdFunction==true) |
+| 36 | `get_selection_strategy` | Fetches a single selection strategy by DPS ID or exact strategy name |
+| 37 | `list_selection_strategies` | Lists all selection strategies with pagination |
+| 39 | `get_placement` | Fetches a single channel placement by DPS ID or exact placement name |
 
 ### Write (require `confirmed: true`)
 
 | # | Tool | What it does |
 |---|---|---|
 | 2 | `create_offer_metadata_fieldgroup` | Creates XDM fieldgroup from CSV columns, attaches to decisioning schema. Checks for duplicates first. |
-| 3 | `bulk_create_offers` | Creates offer items from CSV rows. Supports `dry_run: true` for payload preview |
+| 3 | `bulk_create_offers` | Creates offer items from CSV rows or a JSON array (`csv_text` or `json_text`, exactly one). Optional per-row `eligibility_rule` / `audience` columns (at most one per row). Supports `dry_run: true` for payload preview |
 | 4 | `create_collection` | Creates offer collection with filter constraint |
 | 5 | `create_eligibility_rule` | Creates PQL eligibility rule |
 | 6 | `create_ranking_formula` | Creates ranking formula (static, custom field, recency-hybrid, custom PQL) |
 | 7 | `create_selection_strategy` | Wires collection + rule + formula into a selection strategy |
 | 8 | `create_placement` | Creates channel placement via `/exd-placements` endpoint |
-| 11 | `update_offer_item` | JSON Patch update on any offer field |
+| 11 | `update_offer_item` | JSON Patch update on any offer field. Accepts ID or exact offer name |
 | 12 | `add_schema_field` | Adds a single field to an existing tenant fieldgroup |
 | 13 | `deprecate_schema_field` | Sets `meta:status: deprecated` on a custom tenant field |
 | 14 | `deprecate_oob_field` | Creates `xdm:descriptorDeprecated` for OOB Adobe-managed fields |
 | 15 | `detach_fieldgroup` | Removes fieldgroup from schema `allOf` and `meta:extends` |
+| 22 | `update_collection` | JSON Patch update on an existing item collection. Accepts ID or exact collection name |
+| 23 | `update_eligibility_rule` | JSON Patch update on an existing eligibility rule. Accepts ID or exact rule name |
+| 24 | `update_ranking_formula` | JSON Patch update on an existing ranking formula. Accepts ID or exact formula name |
+| 25 | `update_selection_strategy` | JSON Patch update on an existing selection strategy. Accepts ID or exact strategy name |
+| 26 | `update_placement` | Full-replace (PUT) update on an existing channel placement. Accepts ID or exact placement name |
+| 29 | `delete_collection` | Permanently deletes an item collection. Accepts ID or exact collection name |
+| 32 | `delete_eligibility_rule` | Permanently deletes an eligibility rule. Accepts ID or exact rule name |
+| 35 | `delete_ranking_formula` | Permanently deletes a ranking formula. Accepts ID or exact formula name |
+| 38 | `delete_selection_strategy` | Permanently deletes a selection strategy. Accepts ID or exact strategy name |
+| 40 | `delete_offer_item` | Permanently deletes an offer item. Accepts ID or exact offer name |
+| 41 | `delete_placement` | Permanently deletes a channel placement. Accepts ID or exact placement name |
+| 42 | `bulk_update_offers` | Updates multiple offer items in one call, each with its own JSON Patch operations. Accepts IDs or exact offer names. Supports `dry_run: true` |
+| 43 | `bulk_delete_offers` | Permanently deletes multiple offer items in one call. Accepts IDs or exact offer names |
+| 44 | `attach_offer_eligibility_rule` | Attaches (or removes) offer-level eligibility directly on one or many offer items — independent of any selection strategy. Pick exactly one of: a decision/eligibility rule, an audience, or neither (detach). Accepts IDs or exact names throughout; ambiguous names fail with all matches listed rather than guessing |
+
+Full CRUD (create/list/lookup/update/delete) is now available for offers, collections, eligibility rules, ranking formulas, selection strategies, and placements — including bulk update/delete for offers alongside the existing bulk create, and direct offer-level eligibility-rule attachment (separate from strategy-level wiring). Every tool above that identifies an existing resource — `get_*`, `update_*`, `delete_*`, and the bulk/attach offer tools — accepts either a DPS ID or an exact resource name; a name matching more than one item fails with an error listing every match rather than guessing which one was meant.
+
 
 ### Confirmation pattern
 
@@ -208,6 +220,55 @@ Column mapping:
 - `name` → `itemName` (OOB), `description` → `itemDescription`, `priority` → `itemPriority`, `start_date`/`end_date` → `itemCalendarConstraints`
 - everything else → `_<tenant>.<column>` (custom fieldgroup)
 
+## Sample JSON for testing
+
+`bulk_create_offers` accepts `json_text` instead of `csv_text` — either a bare array of offer objects, or `{"offers": [...]}`. Each object's keys act exactly like CSV column headers, so the same column-mapping rules above apply (matching is case-insensitive and ignores punctuation, so `startDate`, `start_date`, and `Start Date` are all treated the same):
+
+```json
+[
+  {
+    "name": "Summer Glow Kit",
+    "description": "Complete summer skincare set",
+    "category": "Skincare",
+    "brand": "GlowCo",
+    "discount_percent": 20,
+    "price": 49.99,
+    "region": "US",
+    "priority": 1,
+    "start_date": "2024-06-01",
+    "end_date": "2024-08-31"
+  },
+  {
+    "name": "Loyalty 20% Off",
+    "description": "Exclusive 20% for gold members",
+    "category": "Discount",
+    "priority": 1
+  }
+]
+```
+
+Or wrapped: `{"offers": [ ... ]}` — useful if the JSON came from an API response that nests the array under a key. Provide exactly one of `csv_text` or `json_text` per call; passing both or neither returns a clear error instead of a tool call.
+
+---
+
+## Offer-level eligibility: decision rules vs. audiences
+
+Every offer can have at most one of three eligibility states, chosen the same way whether you're creating offers (`bulk_create_offers`'s `eligibility_rule` / `audience` columns) or attaching it after the fact (`attach_offer_eligibility_rule`'s `eligibility_rule_id` / `audience` params):
+
+- **None** — leave both fields empty/omitted. `itemConstraints: { profileConstraintType: "none" }`.
+- **A decision/eligibility rule** — reference an existing `dps:eligibility-rule` by ID or exact name.
+- **An audience** (Real-Time CDP segment) — reference by ID or exact name. Audiences are a genuinely separate resource, managed under their own Audience tab / Unified Profile Segmentation Service — **not** the same list as eligibility rules.
+
+Adobe's offer-item schema only supports `itemConstraints.profileConstraintType: "eligibilityRule"` for actually restricting an offer (confirmed empirically — `"audience"`/`"segment"` as a `profileConstraintType` value are rejected). So attaching an audience works by auto-generating a real eligibility rule that checks segment membership:
+
+```
+segmentMembership["ups"]["<segment-id>"]["status"].equals("realized", false)
+```
+
+named `Audience: <audience name>`. Repeat attach calls for the same audience **reuse** that exact rule (matched by name) rather than creating a duplicate each time — you'll see `"reused existing"` vs `"newly created"` in the tool's response. This auto-generated rule shows up in your eligibility-rule list like any other; its `segmentModel` is left as an unresolved placeholder (AJO's visual Rule Builder will show it blank if reopened there) since the segment-membership syntax isn't representable in the same shape as a normal profile-attribute condition — the rule still works correctly via its PQL, this only affects the visual builder.
+
+Providing both `eligibility_rule` and `audience` (create) or both `eligibility_rule_id` and `audience` (attach) on the same offer/row is rejected with a clear error rather than picking one silently.
+
 ---
 
 ## File layout
@@ -215,7 +276,7 @@ Column mapping:
 ```
 exd-mcp-server-without-auth/
 ├── src/
-│   ├── server.js         ← buildMcpServer(config) + 21 tool definitions
+│   ├── server.js         ← buildMcpServer(config) + 44 tool definitions
 │   ├── stdio.js          ← stdio entry (npm start) — for Claude Desktop
 │   └── http-local.js     ← local HTTP server for testing the Vercel route
 ├── api/
