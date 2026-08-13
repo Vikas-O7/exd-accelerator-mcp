@@ -4,39 +4,102 @@
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![node](https://img.shields.io/badge/node-%E2%89%A518-brightgreen.svg)](.nvmrc)
 
-AI-native Experience Decisioning lifecycle automation for Adobe Journey Optimizer.
-End-to-end ExD setup from a single chat conversation: CSV → schema fields → offers →
-collections → eligibility rules → ranking → selection strategy → placements.
-
-**44 MCP tools** wrapping AEP Schema Registry and Decisioning APIs. Every write
-operation previews what it will do and requires explicit confirmed: true before
-executing.
-
-**Live endpoint:** `https://exd-mcp-server-without-auth.vercel.app/api/mcp`
-**Health:** `https://exd-mcp-server-without-auth.vercel.app/api/health`
+> ### ⚠️ Unofficial project — not an Adobe product
+>
+> This is a **personal open-source project** built and maintained by
+> [Vikas Ohlan](https://github.com/Vikas-O7). It is **not affiliated with,
+> endorsed by, or supported by Adobe Inc.** in any capacity.
+>
+> The project simply calls Adobe Experience Platform's *public* Schema Registry
+> and Decisioning APIs on behalf of a user who already has valid credentials for
+> those APIs. Adobe, Adobe Experience Platform, Adobe Journey Optimizer, and
+> Adobe Experience Decisioning are trademarks of Adobe Inc.; their names appear
+> here only to describe which APIs this project talks to.
+>
+> **You use this software at your own risk.** No warranty, no support SLA, and
+> no guarantee of compatibility with any future Adobe API changes.
 
 ---
 
-## Two ways to run this
+An [MCP (Model Context Protocol)](https://modelcontextprotocol.io) server that
+wraps Adobe Experience Platform's Schema Registry and Decisioning (DPS) APIs so
+an LLM client — Claude Desktop, Claude Code, or any other MCP-capable
+assistant — can help you build a complete Experience Decisioning setup from a
+single chat conversation:
 
-### A. Local stdio (Claude Desktop)
+CSV → schema fields → offers → collections → eligibility rules → ranking →
+selection strategy → placements.
+
+**47 tools.** Every write operation previews what it will do and requires an
+explicit `confirmed: true` before executing. Cursor pagination throughout,
+soft deadlines on bulk operations, automatic 409/429/5xx retries, and
+dependency-scan previews on every destructive delete.
+
+---
+
+## What you need to try this
+
+Before you can run anything against a live sandbox, you need Adobe access —
+this project doesn't provision anything for you.
+
+1. **An Adobe Experience Platform sandbox** with Experience Decisioning
+   enabled. This is licensed capability; if you don't have it, most of the
+   tools will fail with a 403.
+2. **An OAuth Server-to-Server credential** created in
+   [Adobe Developer Console](https://developer.adobe.com/console), attached to
+   a product profile that grants Experience Platform access for your target
+   sandbox. You'll need the resulting `CLIENT_ID` and `CLIENT_SECRET`.
+3. **Node.js ≥ 18** (for local runs) — or a Vercel / Adobe I/O Runtime account
+   if you want to host the server yourself.
+4. **An MCP-compatible client** — the reference is
+   [Claude Desktop](https://claude.ai/download); Claude Code and any other
+   client that speaks the MCP protocol will also work.
+
+You'll also need to know these tenant-specific values for your sandbox:
+
+| Value | Where to find it |
+|---|---|
+| `ORG_ID` | Adobe Admin Console → your org's ID (ends in `@AdobeOrg`) |
+| `SANDBOX_NAME` | Experience Platform → Sandboxes |
+| `TENANT_ID` | Experience Platform → Schemas → look at any tenant-scoped schema (the `_` prefix) |
+| `DECISIONING_SCHEMA_URI` / `DECISIONING_SCHEMA_ALT_ID` | Your Personalized Offer Items schema in Schema Registry |
+| `ITEM_CATALOG_ID` | Decisioning → Catalogs |
+
+---
+
+## Quick start (local, stdio)
+
+Fastest way to try it: run against your own sandbox from your laptop, no
+hosting needed.
 
 ```bash
+git clone https://github.com/Vikas-O7/exd-accelerator-mcp.git
+cd exd-accelerator-mcp
 npm install
-cp .env.example .env       # fill in CLIENT_ID, CLIENT_SECRET, sandbox, schema, catalog
-npm start                  # runs src/stdio.js
+cp .env.example .env
+# open .env and fill in the 8 required values
 ```
 
-Then point Claude Desktop at it (`%APPDATA%\Claude\claude_desktop_config.json` on
-Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on
-macOS):
+Sanity-check with the smoke test (makes real API calls to your sandbox):
+
+```bash
+npm run smoke
+```
+
+You should see `All smoke checks passed.` If not, jump to [Troubleshooting](#troubleshooting).
+
+### Wire it into Claude Desktop
+
+Edit your Claude Desktop config
+(`%APPDATA%\Claude\claude_desktop_config.json` on Windows,
+`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "exd-accelerator": {
       "command": "node",
-      "args": ["/absolute/path/to/exd-mcp-server/src/stdio.js"],
+      "args": ["/absolute/path/to/exd-accelerator-mcp/src/stdio.js"],
       "env": {
         "CLIENT_ID":                 "…",
         "CLIENT_SECRET":             "…",
@@ -52,162 +115,74 @@ macOS):
 }
 ```
 
-Restart Claude Desktop. You'll see the 🔧 tool icon — ExD Accelerator is live.
+Restart Claude Desktop. You'll see the 🔧 tool icon — the ExD Accelerator is
+live.
 
-### B. Vercel deployment (for sharing with Adobe coworkers)
+---
 
-1. Push this repo to GitHub.
-2. Import it in [vercel.com/new](https://vercel.com/new). Framework preset: **Other**.
+## Hosting it yourself (HTTP)
+
+If you want a shared endpoint your team can point their MCP clients at, deploy
+the same codebase as an HTTP server. Two supported targets:
+
+### Option A — Vercel (simplest)
+
+1. Fork or clone this repo into your own GitHub account.
+2. Import it in [vercel.com/new](https://vercel.com/new). Framework preset:
+   **Other**.
 3. Deploy — Vercel auto-detects `api/mcp.js` as the serverless route.
-4. **Do not** add Adobe credentials to Vercel environment variables. Each coworker
-   supplies their own credentials via HTTP headers when they connect.
+4. **Do not** put Adobe credentials in Vercel's environment variables. Each
+   user of the endpoint supplies their own credentials via HTTP headers on
+   the MCP connection (see below).
 
-#### Adobe coworker setup
+### Option B — Adobe I/O Runtime (App Builder)
 
-Once deployed at `https://your-app.vercel.app`, each coworker adds this in their
-MCP client config (Claude Desktop, Adobe AO Chat, Claude.ai, etc.):
+If you have Adobe App Builder access, `actions/mcp/index.js` and
+`app.config.yaml` are ready to go. From a checkout with `@adobe/aio-cli`
+installed and logged into your workspace:
 
-| Setting | Value |
-|---|---|
-| Server URL | `https://your-app.vercel.app/api/mcp` |
-| Transport | Streamable HTTP |
-| Auth | None at the transport level — credentials go in headers |
+```bash
+aio app deploy
+```
 
-Custom headers (one-time, in the MCP client config — NOT in chat messages):
+The action is configured with `require-adobe-auth: false` so each MCP client
+call carries the user's own AEP credentials — same header-based model as the
+Vercel deployment.
+
+### Header-based multi-tenant credentials
+
+The server treats HTTP headers as the source of truth for per-request
+credentials, so a single hosted deployment can serve multiple users without
+storing any secrets on the server side:
 
 ```
 x-adobe-client-id:      <Adobe Dev Console: Client ID>
 x-adobe-client-secret:  <Adobe Dev Console: Client Secret>
 x-adobe-org-id:         <IMS Org ID>@AdobeOrg
 x-adobe-sandbox:        <sandbox name>
-x-adobe-tenant-id:      <tenant id, e.g. acssandboxgdcthree>
+x-adobe-tenant-id:      <tenant id, e.g. mytenantname>
 x-adobe-schema-uri:     https://ns.adobe.com/<tenant>/schemas/<id>
 x-adobe-schema-alt-id:  _<tenant>.schemas.<id>
 x-adobe-catalog-id:     xcore:decision-catalog:<id>
 ```
 
-The server uses `client_credentials` to mint a token automatically, caches it per
-client_id, and refreshes on expiry. The marketer never sees the token.
+The server uses `client_credentials` to mint tokens automatically, caches them
+per `client_id` for the token's lifetime, invalidates on 401, and refreshes on
+expiry. The end user never sees the token.
 
----
+MCP client config for a hosted deployment:
 
-## Is Vercel a good fit for a production MCP endpoint?
-
-**Yes, for this workload.** Each MCP tool call is a single short HTTP roundtrip
-to Adobe Platform APIs — no long-running state, no streaming required, no
-WebSocket. Vercel's serverless model maps cleanly:
-
-| Concern | Verdict |
+| Setting | Value |
 |---|---|
-| Stateless requests | ✅ Each MCP call is independent. No session state. |
-| Cold-start latency | ⚠️ ~300–500ms on first call after idle. Subsequent calls reuse the warm container. |
-| 60s function timeout (Pro tier) | ⚠️ `bulk_create_offers` with >50 rows may exceed this. Chunk large batches. |
-| 10s timeout (Hobby tier) | ⚠️ `get_setup_summary` is fine; large bulk is not. Upgrade to Pro for production use. |
-| Auto-scaling | ✅ Each coworker's request gets its own invocation. |
-| HTTPS, custom domain, env-per-deploy | ✅ Built in. |
-| SSE / long-polling | ❌ Not used here — we run **Streamable HTTP with `enableJsonResponse: true`**, which is single-request/response and fits serverless perfectly. |
-
-**When Vercel isn't right:** if you need server-initiated notifications, very
-large bulk operations (hundreds of writes), or stateful sessions across many
-calls, deploy to a long-lived host (Railway, Render, Fly, ECS) and run the same
-codebase. The transport layer is the only difference.
+| Server URL | `https://your-deployment/api/mcp` |
+| Transport | Streamable HTTP |
+| Auth | None at the transport level — credentials go in headers |
 
 ---
 
-## All 44 tools
+## Sample data for testing
 
-### Read-only (no confirmation needed)
-
-| # | Tool | What it does |
-|---|---|---|
-| 1 | `parse_csv_and_suggest` | Parses CSV, infers XDM types per column, suggests eligibility rules and ranking formulas. Always call first. No API calls. |
-| 9 | `get_offer_item` | Fetches a single offer item by DPS ID or exact offer name |
-| 10 | `list_offer_items` | Lists all offers in catalog with pagination |
-| 16 | `get_setup_summary` | Full inventory: offers, collections, rules, formulas, strategies, placements |
-| 17 | `lookup_decisioning_schema` | Full resolved schema with OOB + tenant fields; accepts `include_deprecated: true` |
-| 18 | `list_schema_fieldgroups` | Lists all tenant fieldgroups for the offer item class |
-| 19 | `get_fieldgroup` | Full field definitions inside a specific fieldgroup |
-| 20 | `get_schema_audit_log` | Chronological change history for the decisioning schema |
-| 21 | `list_schema_descriptors` | Identity, deprecation, display name, relationship descriptors |
-| 27 | `get_collection` | Fetches a single item collection by DPS ID or exact collection name |
-| 28 | `list_collections` | Lists all item collections with pagination |
-| 30 | `get_eligibility_rule` | Fetches a single eligibility rule by DPS ID or exact rule name |
-| 31 | `list_eligibility_rules` | Lists all ExD eligibility rules with pagination (filters to exdRule==true) |
-| 33 | `get_ranking_formula` | Fetches a single ranking formula by DPS ID or exact formula name |
-| 34 | `list_ranking_formulas` | Lists all ExD ranking formulas with pagination (filters to exdFunction==true) |
-| 36 | `get_selection_strategy` | Fetches a single selection strategy by DPS ID or exact strategy name |
-| 37 | `list_selection_strategies` | Lists all selection strategies with pagination |
-| 39 | `get_placement` | Fetches a single channel placement by DPS ID or exact placement name |
-
-### Write (require `confirmed: true`)
-
-| # | Tool | What it does |
-|---|---|---|
-| 2 | `create_offer_metadata_fieldgroup` | Creates XDM fieldgroup from CSV columns, attaches to decisioning schema. Checks for duplicates first. |
-| 3 | `bulk_create_offers` | Creates offer items from CSV rows or a JSON array (`csv_text` or `json_text`, exactly one). Optional per-row `eligibility_rule` / `audience` columns (at most one per row). Supports `dry_run: true` for payload preview |
-| 4 | `create_collection` | Creates offer collection with filter constraint |
-| 5 | `create_eligibility_rule` | Creates PQL eligibility rule |
-| 6 | `create_ranking_formula` | Creates ranking formula (static, custom field, recency-hybrid, custom PQL) |
-| 7 | `create_selection_strategy` | Wires collection + rule + formula into a selection strategy |
-| 8 | `create_placement` | Creates channel placement via `/exd-placements` endpoint |
-| 11 | `update_offer_item` | JSON Patch update on any offer field. Accepts ID or exact offer name |
-| 12 | `add_schema_field` | Adds a single field to an existing tenant fieldgroup |
-| 13 | `deprecate_schema_field` | Sets `meta:status: deprecated` on a custom tenant field |
-| 14 | `deprecate_oob_field` | Creates `xdm:descriptorDeprecated` for OOB Adobe-managed fields |
-| 15 | `detach_fieldgroup` | Removes fieldgroup from schema `allOf` and `meta:extends` |
-| 22 | `update_collection` | JSON Patch update on an existing item collection. Accepts ID or exact collection name |
-| 23 | `update_eligibility_rule` | JSON Patch update on an existing eligibility rule. Accepts ID or exact rule name |
-| 24 | `update_ranking_formula` | JSON Patch update on an existing ranking formula. Accepts ID or exact formula name |
-| 25 | `update_selection_strategy` | JSON Patch update on an existing selection strategy. Accepts ID or exact strategy name |
-| 26 | `update_placement` | Full-replace (PUT) update on an existing channel placement. Accepts ID or exact placement name |
-| 29 | `delete_collection` | Permanently deletes an item collection. Accepts ID or exact collection name |
-| 32 | `delete_eligibility_rule` | Permanently deletes an eligibility rule. Accepts ID or exact rule name |
-| 35 | `delete_ranking_formula` | Permanently deletes a ranking formula. Accepts ID or exact formula name |
-| 38 | `delete_selection_strategy` | Permanently deletes a selection strategy. Accepts ID or exact strategy name |
-| 40 | `delete_offer_item` | Permanently deletes an offer item. Accepts ID or exact offer name |
-| 41 | `delete_placement` | Permanently deletes a channel placement. Accepts ID or exact placement name |
-| 42 | `bulk_update_offers` | Updates multiple offer items in one call, each with its own JSON Patch operations. Accepts IDs or exact offer names. Supports `dry_run: true` |
-| 43 | `bulk_delete_offers` | Permanently deletes multiple offer items in one call. Accepts IDs or exact offer names |
-| 44 | `attach_offer_eligibility_rule` | Attaches (or removes) offer-level eligibility directly on one or many offer items — independent of any selection strategy. Pick exactly one of: a decision/eligibility rule, an audience, or neither (detach). Accepts IDs or exact names throughout; ambiguous names fail with all matches listed rather than guessing |
-
-Full CRUD (create/list/lookup/update/delete) is now available for offers, collections, eligibility rules, ranking formulas, selection strategies, and placements — including bulk update/delete for offers alongside the existing bulk create, and direct offer-level eligibility-rule attachment (separate from strategy-level wiring). Every tool above that identifies an existing resource — `get_*`, `update_*`, `delete_*`, and the bulk/attach offer tools — accepts either a DPS ID or an exact resource name; a name matching more than one item fails with an error listing every match rather than guessing which one was meant.
-
-
-### Confirmation pattern
-
-Every write tool shows a preview and blocks with:
-
-```
-⚠️  CONFIRMATION REQUIRED — no changes made yet
-[preview of what will happen]
-✅ To proceed, call this tool again with confirmed: true
-```
-
-Call the same tool again with `confirmed: true` to execute.
-
----
-
-## Recommended workflow from a fresh CSV
-
-```
-1.  parse_csv_and_suggest            → analyse CSV, no writes
-2.  list_schema_fieldgroups          → check if fieldgroup already exists
-3.  create_offer_metadata_fieldgroup → push schema fields (confirmed: true)
-4.  lookup_decisioning_schema        → verify fields attached
-5.  bulk_create_offers (dry_run)     → preview offer payloads
-6.  bulk_create_offers (confirmed)   → create offers
-7.  list_offer_items                 → verify
-8.  create_collection                → group offers (confirmed: true)
-9.  create_eligibility_rule          → targeting (confirmed: true)
-10. create_ranking_formula           → ranking logic (confirmed: true)
-11. create_selection_strategy        → wire it all together (confirmed: true)
-12. create_placement                 → define channel (confirmed: true)
-13. get_setup_summary                → verify full setup
-```
-
----
-
-## Sample CSV for testing
+### CSV
 
 ```csv
 name,description,category,brand,discount_percent,price,region,priority,start_date,end_date
@@ -217,12 +192,17 @@ Loyalty 20% Off,Exclusive 20% for gold members,Discount,GlowCo,20,0,Global,1,202
 ```
 
 Column mapping:
-- `name` → `itemName` (OOB), `description` → `itemDescription`, `priority` → `itemPriority`, `start_date`/`end_date` → `itemCalendarConstraints`
-- everything else → `_<tenant>.<column>` (custom fieldgroup)
+- `name` → `itemName` (OOB), `description` → `itemDescription`, `priority` →
+  `itemPriority`, `start_date`/`end_date` → `itemCalendarConstraints`
+- everything else → `_<tenant>.<column>` (custom fieldgroup, created for you
+  on first use)
 
-## Sample JSON for testing
+### JSON
 
-`bulk_create_offers` accepts `json_text` instead of `csv_text` — either a bare array of offer objects, or `{"offers": [...]}`. Each object's keys act exactly like CSV column headers, so the same column-mapping rules above apply (matching is case-insensitive and ignores punctuation, so `startDate`, `start_date`, and `Start Date` are all treated the same):
+`bulk_create_offers` accepts `json_text` in place of `csv_text` — either a
+bare array of offer objects, or `{"offers": [...]}`. Each object's keys act
+exactly like CSV column headers (case-insensitive, punctuation-tolerant, so
+`startDate`, `start_date`, and `Start Date` are all treated the same):
 
 ```json
 [
@@ -237,53 +217,162 @@ Column mapping:
     "priority": 1,
     "start_date": "2024-06-01",
     "end_date": "2024-08-31"
-  },
-  {
-    "name": "Loyalty 20% Off",
-    "description": "Exclusive 20% for gold members",
-    "category": "Discount",
-    "priority": 1
   }
 ]
 ```
 
-Or wrapped: `{"offers": [ ... ]}` — useful if the JSON came from an API response that nests the array under a key. Provide exactly one of `csv_text` or `json_text` per call; passing both or neither returns a clear error instead of a tool call.
+Provide exactly one of `csv_text` or `json_text`; passing both or neither
+returns a clear error.
+
+---
+
+## Recommended workflow from a fresh CSV
+
+```
+1.  parse_csv_and_suggest            → analyse CSV, no writes
+2.  list_schema_fieldgroups          → check if fieldgroup already exists
+3.  create_offer_metadata_fieldgroup → push schema fields (confirmed: true)
+4.  lookup_decisioning_schema        → verify fields attached
+5.  bulk_create_offers (dry_run)     → preview offer payloads
+6.  bulk_create_offers (confirmed)   → create offers
+7.  list_offer_items                 → verify
+8.  list_placements                  → discover placements to wire to
+9.  list_audiences                   → discover audiences to target (RT-CDP)
+10. create_collection                → group offers (confirmed: true)
+11. create_eligibility_rule          → targeting (confirmed: true)
+12. create_ranking_formula           → ranking logic (confirmed: true)
+13. create_selection_strategy        → wire it all together (confirmed: true)
+14. get_setup_summary                → verify full setup
+```
+
+Or, in a real chat, just say something like:
+*"I have a CSV of 25 skincare offers here. Load them into `my-sandbox`, group
+by category, target visitors in the DOI Email Audience, rank by discount
+descending, and wire it all to my hero-banner placement."*
+
+---
+
+## Tool inventory
+
+47 tools organized by resource. Every write requires `confirmed: true`.
+
+### Utility / setup (7)
+
+`get_setup_summary`, `lookup_decisioning_schema`, `list_schema_descriptors`,
+`list_schema_fieldgroups`, `get_fieldgroup`, `get_schema_audit_log`,
+`parse_csv_and_suggest`.
+
+### Schema mutation (5)
+
+`add_schema_field`, `deprecate_schema_field`, `deprecate_oob_field`,
+`detach_fieldgroup`, `create_offer_metadata_fieldgroup`.
+
+### Placements (5)
+
+`list_placements`, `get_placement`, `create_placement`, `update_placement`,
+`delete_placement`.
+
+### Offer items (8)
+
+`list_offer_items`, `get_offer_item`, `update_offer_item`, `delete_offer_item`,
+`bulk_create_offers`, `bulk_update_offers`, `bulk_delete_offers`,
+`attach_offer_eligibility_rule`.
+
+### Collections (5)
+
+`list_collections`, `get_collection`, `create_collection`, `update_collection`,
+`delete_collection`.
+
+### Eligibility rules (5)
+
+`list_eligibility_rules`, `get_eligibility_rule`, `create_eligibility_rule`,
+`update_eligibility_rule`, `delete_eligibility_rule`.
+
+### Ranking formulas (5)
+
+`list_ranking_formulas`, `get_ranking_formula`, `create_ranking_formula`,
+`update_ranking_formula`, `delete_ranking_formula`.
+
+### Selection strategies (5)
+
+`list_selection_strategies`, `get_selection_strategy`,
+`create_selection_strategy`, `update_selection_strategy`,
+`delete_selection_strategy`.
+
+### RT-CDP audiences (2, read-only)
+
+`list_audiences`, `get_audience` — audiences themselves are managed in the
+RT-CDP Segmentation Service, not here. These two just let the LLM discover
+them before wiring them into offer eligibility.
+
+Every tool that identifies an existing resource — `get_*`, `update_*`,
+`delete_*`, and the bulk / attach offer tools — accepts either a DPS ID **or**
+an exact resource name. Ambiguous names fail with a list of all matches
+rather than guessing.
+
+### Confirmation pattern
+
+Every write tool shows a preview and blocks with:
+
+```
+⚠️  CONFIRMATION REQUIRED — no changes made yet
+[preview of what will happen]
+✅ To proceed, call this tool again with confirmed: true
+```
+
+Call the same tool again with `confirmed: true` to execute. Delete tools also
+scan for dependencies (e.g. selection strategies that reference this
+collection) and print the count in the preview so you see the blast radius
+before confirming.
 
 ---
 
 ## Offer-level eligibility: decision rules vs. audiences
 
-Every offer can have at most one of three eligibility states, chosen the same way whether you're creating offers (`bulk_create_offers`'s `eligibility_rule` / `audience` columns) or attaching it after the fact (`attach_offer_eligibility_rule`'s `eligibility_rule_id` / `audience` params):
+Every offer can have at most one of three eligibility states, chosen the same
+way whether you're creating offers (`bulk_create_offers`'s `eligibility_rule`
+/ `audience` columns) or attaching later
+(`attach_offer_eligibility_rule`'s `eligibility_rule_id` / `audience` params):
 
-- **None** — leave both fields empty/omitted. `itemConstraints: { profileConstraintType: "none" }`.
-- **A decision/eligibility rule** — reference an existing `dps:eligibility-rule` by ID or exact name.
-- **An audience** (Real-Time CDP segment) — reference by ID or exact name. Audiences are a genuinely separate resource, managed under their own Audience tab / Unified Profile Segmentation Service — **not** the same list as eligibility rules.
+- **None** — leave both fields empty. `itemConstraints:
+  { profileConstraintType: "none" }`.
+- **A decision/eligibility rule** — reference an existing `dps:eligibility-rule`
+  by ID or exact name.
+- **An audience** (RT-CDP segment) — reference by ID or exact name.
 
-Adobe's offer-item schema only supports `itemConstraints.profileConstraintType: "eligibilityRule"` for actually restricting an offer (confirmed empirically — `"audience"`/`"segment"` as a `profileConstraintType` value are rejected). So attaching an audience works by auto-generating a real eligibility rule that checks segment membership:
+Adobe's offer-item schema only supports
+`itemConstraints.profileConstraintType: "eligibilityRule"` for actually
+restricting an offer. Attaching an audience works by auto-generating a real
+eligibility rule that checks segment membership:
 
 ```
 segmentMembership["ups"]["<segment-id>"]["status"].equals("realized", false)
 ```
 
-named `Audience: <audience name>`. Repeat attach calls for the same audience **reuse** that exact rule (matched by name) rather than creating a duplicate each time — you'll see `"reused existing"` vs `"newly created"` in the tool's response. This auto-generated rule shows up in your eligibility-rule list like any other; its `segmentModel` is left as an unresolved placeholder (AJO's visual Rule Builder will show it blank if reopened there) since the segment-membership syntax isn't representable in the same shape as a normal profile-attribute condition — the rule still works correctly via its PQL, this only affects the visual builder.
+named `Audience: <audience name>`. Repeat attach calls for the same audience
+**reuse** that exact rule (matched by name) rather than creating a duplicate.
 
-Providing both `eligibility_rule` and `audience` (create) or both `eligibility_rule_id` and `audience` (attach) on the same offer/row is rejected with a clear error rather than picking one silently.
+Providing both `eligibility_rule` and `audience` on the same offer/row is
+rejected with a clear error rather than silently picking one.
 
 ---
 
 ## File layout
 
 ```
-exd-mcp-server-without-auth/
+exd-accelerator-mcp/
 ├── src/
-│   ├── server.js         ← buildMcpServer(config) + 44 tool definitions
+│   ├── server.js         ← buildMcpServer(config) + 47 tool definitions
 │   ├── stdio.js          ← stdio entry (npm start) — for Claude Desktop
-│   └── http-local.js     ← local HTTP server for testing the Vercel route
+│   └── http-local.js     ← local HTTP server for testing the hosted route
 ├── api/
 │   └── mcp.js            ← Vercel serverless route (Streamable HTTP)
+├── actions/mcp/
+│   └── index.js          ← Adobe I/O Runtime action (App Builder)
 ├── scripts/
-│   └── smoke.js          ← smoke test for stdio + HTTP transports
-├── vercel.json
+│   └── smoke.js          ← 29-check smoke test for stdio + HTTP
+├── app.config.yaml       ← App Builder deployment config
+├── vercel.json           ← Vercel deployment config
 ├── package.json
 ├── .env.example
 └── .gitignore
@@ -291,35 +380,49 @@ exd-mcp-server-without-auth/
 
 ---
 
-## Smoke testing
-
-```bash
-npm install
-cp .env.example .env       # fill in
-npm run smoke              # runs stdio + HTTP transport tests, calls real Adobe APIs
-```
-
-Expected output ends with `All smoke checks passed.`
-
----
-
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `Missing credentials` | CLIENT_ID/CLIENT_SECRET not set | Add to `.env` (local) or to your MCP client's header config (deployed) |
-| `IMS token mint failed (401)` | Credentials invalid or revoked | Regenerate the OAuth Server-to-Server credential in Adobe Developer Console |
-| `401 Oauth token is not valid` from Adobe | Credential lacks AEP access | The OAuth credential's product profile needs `Adobe Experience Platform` access for the target sandbox |
-| `403 Forbidden` | Wrong org/sandbox | Check `ORG_ID` and `SANDBOX_NAME` |
+| `Missing credentials` | CLIENT_ID/CLIENT_SECRET not set | Add to `.env` (local) or to your MCP client's header config (hosted) |
+| `IMS token mint failed (401)` | Credentials invalid or revoked | Regenerate the OAuth Server-to-Server credential in Developer Console |
+| `401 Oauth token is not valid` from Adobe | Credential lacks AEP access | The credential's product profile needs Experience Platform access for the target sandbox |
+| `403 Forbidden` | Wrong org/sandbox for these creds | Check `ORG_ID` and `SANDBOX_NAME` |
 | List offers returns 0 | Wrong `ITEM_CATALOG_ID` for the sandbox | Each sandbox has its own catalog ID |
-| Tool call exceeds 10s on Vercel Hobby | Bulk operation too large | Upgrade to Pro (60s) or chunk the CSV |
-| `lookup_decisioning_schema` shows 0 fieldgroups | Resolved by 2.0 — file an issue if you still see this | — |
+| Bulk call exceeds 10s on Vercel Hobby | Function timeout | Upgrade to Pro (60s) or reduce `limit` |
+| Custom XDM validation error on create | Sandbox schema has required fields you didn't supply | Read the error's field list, add the missing columns to your CSV/JSON |
+| `MCP server connection lost` mid-bulk | Runtime hit its 60s hard cap | Lower `limit` and `chunk_size`; the tool will paginate itself |
 
 ---
 
-## What this MCP does NOT do (future scope)
+## What this MCP does NOT do
 
-- **Decisioning policy / campaign creation** — creates components but not the final AJO policy that ties strategy + placement.
-- **Delete operations** — AEP recommends archive over delete.
-- **Audience creation** — eligibility rules reference profile attributes but don't create AEP segments.
-- **Cross-channel coherence scoring** — would require AEP Query Service integration.
+- **AJO policy / campaign creation** — creates the ExD components (offers,
+  strategies, placements) but not the final Journey Optimizer policy that ties
+  them into a live delivery.
+- **RT-CDP audience creation** — surfaces existing audiences via `list_audiences`
+  but doesn't create new segments (that's Segmentation Service's job).
+- **Cross-channel reporting** — would need AEP Query Service integration.
+- **Anything unofficial or private** — this project only wraps documented,
+  publicly available APIs. If Adobe changes those APIs, expect breakage until
+  the wrapper catches up.
+
+---
+
+## Contributing
+
+PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Please attach a smoke
+run (`npm run smoke`) with your change.
+
+---
+
+## Ownership and license
+
+Copyright © 2026 **Vikas Ohlan**. Released under the
+[Apache License 2.0](LICENSE).
+
+This project is developed independently. It is **not an Adobe product** and
+carries no support relationship with Adobe Inc. Adobe, Adobe Experience
+Platform, Adobe Journey Optimizer, and Adobe Experience Decisioning are
+trademarks of Adobe Inc.; they appear in this documentation only to describe
+which public APIs the software calls on the user's behalf.
