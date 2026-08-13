@@ -41,6 +41,49 @@ dependency-scan previews on every destructive delete.
 
 ---
 
+## Try it in 30 seconds (hosted demo)
+
+A demo endpoint is running on free Vercel infra:
+
+- **MCP URL:** `https://exd-accelerator-mcp.vercel.app/api/mcp`
+- **About / terms:** [`https://exd-accelerator-mcp.vercel.app/api/about`](https://exd-accelerator-mcp.vercel.app/api/about)
+- **Health check:** [`https://exd-accelerator-mcp.vercel.app/api/health`](https://exd-accelerator-mcp.vercel.app/api/health)
+
+Add it to your MCP client (Claude Desktop, Claude Code, etc.) with these
+settings — supplying your **own Adobe credentials** as HTTP headers:
+
+| Setting | Value |
+|---|---|
+| Server URL | `https://exd-accelerator-mcp.vercel.app/api/mcp` |
+| Transport | Streamable HTTP |
+| Auth | None at the transport level — credentials go in headers |
+
+Headers to configure (from Adobe Developer Console for your **development
+sandbox** — never a production sandbox):
+
+```
+x-adobe-client-id:      <OAuth Server-to-Server Client ID>
+x-adobe-client-secret:  <OAuth Server-to-Server Client Secret>
+x-adobe-org-id:         <your IMS Org ID>@AdobeOrg
+x-adobe-sandbox:        <development sandbox name>
+x-adobe-tenant-id:      <your tenant id>
+x-adobe-schema-uri:     <full decisioning schema $id URI>
+x-adobe-schema-alt-id:  <decisioning schema meta:altId>
+x-adobe-catalog-id:     xcore:decision-catalog:xxxxxxxxxxxxxxxx
+```
+
+The server holds these headers in memory only for the lifetime of the request,
+mints an IMS token, calls Adobe on your behalf, and discards everything when
+the call completes. Nothing is written to disk. See the
+[`/api/about`](https://exd-accelerator-mcp.vercel.app/api/about) page for the
+full statement.
+
+**The demo endpoint runs on Vercel's free Hobby tier with no uptime commitment
+and no support SLA.** For anything more than kicking tires, fork this repo and
+self-host — instructions below.
+
+---
+
 ## What you need to try this
 
 Before you can run anything against a live sandbox, you need Adobe access —
