@@ -63,7 +63,7 @@ export default async function handler(req, res) {
       server: "exd-accelerator",
       version: "2.0.0",
       transport: "streamable-http",
-      message: "POST JSON-RPC 2.0 here. See https://github.com/Vikas-O7/exd-accelerator-mcp for setup.",
+      message: "POST JSON-RPC 2.0 here.",
     }));
     return;
   }

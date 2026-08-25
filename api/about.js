@@ -10,17 +10,15 @@ const DISCLAIMER = {
   title: "ExD Accelerator — MCP Server",
   tagline: "Community-maintained side project. Not an Adobe product.",
   maintainers: [
-    { name: "Khushi Nayal", github: "https://github.com/khushi-nayal" },
-    { name: "Vikas Ohlan",  github: "https://github.com/Vikas-O7" },
+    { name: "Khushi Nayal" },
+    { name: "Vikas Ohlan"  },
   ],
-  source:      "https://github.com/Vikas-O7/exd-accelerator-mcp",
-  issues:      "https://github.com/Vikas-O7/exd-accelerator-mcp/issues",
   license:     "Apache-2.0",
   affiliation: "None. This project is independent and is NOT affiliated with, endorsed by, produced by, or supported by Adobe Inc. Adobe, Adobe Experience Platform, Adobe Journey Optimizer, and Adobe Experience Decisioning are trademarks of Adobe Inc. — named here only to describe which public APIs this software calls on behalf of the user.",
   intendedUse: "Development sandbox exploration only. NOT for production sandboxes.",
   warranty:    "None. Provided AS-IS under the Apache 2.0 license, without warranty of any kind, express or implied.",
   sla:         "None. No uptime commitments. Endpoint runs on Vercel's free Hobby tier and may pause or go offline at any time.",
-  support:     "Best-effort via GitHub Issues only. No email, no chat, no on-call.",
+  support:     "Best-effort community support only. No email, no chat, no on-call.",
   credentialHandling: {
     location: "Adobe credentials are sent by the user in HTTP request headers on each call.",
     storage:  "Held in memory only for the lifetime of a single request. Never written to disk. Never persisted.",
@@ -62,13 +60,12 @@ function renderHtml(d) {
   </div>
 
   <h2>Maintainers</h2>
-  <ul>${list(d.maintainers, m => `<li><a href="${m.github}">${m.name}</a></li>`)}</ul>
+  <ul>${list(d.maintainers, m => `<li>${m.name}</li>`)}</ul>
 
-  <h2>Source &amp; License</h2>
+  <h2>License</h2>
   <ul>
-    <li><a href="${d.source}">${d.source}</a></li>
     <li>License: <code>${d.license}</code></li>
-    <li>Issues &amp; support: <a href="${d.issues}">GitHub Issues</a> (best-effort only)</li>
+    <li>Support: ${d.support}</li>
   </ul>
 
   <h2>Affiliation</h2>
