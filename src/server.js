@@ -1270,12 +1270,16 @@ function buildFieldsFromColumns(columns, sampleRow) {
   return { properties };
 }
 
-// Sensible defaults: start = today UTC, end = +1 year. Fix for bug where defaults
-// were hardcoded to past dates (2024-06-10).
+// Safe fallback: start = today UTC, end = +7 days. This is a safety net, NOT a
+// business default — every real campaign has a meaningful window. Previous default
+// was +1 year, which quietly ran offers a year past whatever campaign they were
+// meant for. 7 days forces a conscious review at week's end and makes the mismatch
+// visible fast if the caller forgot to specify. Callers should always ask the user
+// for real dates first; this default only fires when nothing was specified anywhere.
 function defaultDateRange() {
   const now   = new Date();
   const later = new Date(now.getTime());
-  later.setUTCFullYear(later.getUTCFullYear() + 1);
+  later.setUTCDate(later.getUTCDate() + 7);
   return { startDate: now.toISOString(), endDate: later.toISOString() };
 }
 
@@ -1451,10 +1455,18 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
 
   // ════════ TOOL 3 — bulk_create_offers ════════════════════════════════════════
   server.tool("bulk_create_offers",
-    `Bulk-create ExD offer items from CSV rows or a JSON array of offer objects. Each row/object becomes one offer. Provide exactly one of csv_text or json_text. Optional per-row eligibility_rule / audience columns restrict that offer's eligibility (at most one of the two per row) — same three-way choice (none / decision rule / audience) as attach_offer_eligibility_rule. Requires confirmed: true to execute — previews payloads first. Use dry_run: true to inspect full JSON payloads. Supports large CSVs (100+ rows) via offset/limit pagination: each call processes up to ~40 offers within Adobe I/O Runtime's 60s function cap, then returns a "call again with offset:X" hint. LLMs should chain calls automatically for big batches.`,
+    `Bulk-create ExD offer items from CSV rows or a JSON array of offer objects. Each row/object becomes one offer. Provide exactly one of csv_text or json_text. Optional per-row eligibility_rule / audience columns restrict that offer's eligibility (at most one of the two per row) — same three-way choice (none / decision rule / audience) as attach_offer_eligibility_rule.
+
+📅 EVERY OFFER NEEDS A START AND END DATE ("itemCalendarConstraints" in Adobe Experience Decisioning). These control when the offer is eligible for delivery: before start_date the decision engine treats the offer as not-yet-active; after end_date it treats the offer as expired and silently skips it during selection — regardless of the offer's eligibility rule, ranking score, or lifecycle status. Missing or wrong dates are one of the most common reasons an offer never surfaces in production, so decide them deliberately.
+
+Date resolution priority (per row): CSV column ("start_date" / "end_date" or aliases) → tool param (start_date / end_date) → safe default (today UTC → today + 7 days UTC). ALWAYS ask the user for the actual campaign window before calling — the 7-day default is a safety net for testing, not a business decision. Longer campaigns (e.g. a summer sale ending 2026-09-01) must be specified explicitly. The confirmation preview shows the resolved window so the user can catch a mistake before execution.
+
+Requires confirmed: true to execute — previews payloads first. Use dry_run: true to inspect full JSON payloads. Supports large CSVs (100+ rows) via offset/limit pagination: each call processes up to ~40 offers within Adobe I/O Runtime's 60s function cap, then returns a "call again with offset:X" hint. LLMs should chain calls automatically for big batches.`,
     {
-      csv_text:         z.string().optional().describe(`Full CSV text (header row + data rows). Provide this OR json_text, not both. Optional columns "eligibility_rule" and "audience" (ID or exact name; at most one per row) attach offer-level eligibility.`),
+      csv_text:         z.string().optional().describe(`Full CSV text (header row + data rows). Provide this OR json_text, not both. Optional columns "eligibility_rule" and "audience" (ID or exact name; at most one per row) attach offer-level eligibility. Optional columns "start_date" and "end_date" set per-row calendar constraints and take precedence over the tool params below.`),
       json_text:        z.string().optional().describe(`JSON text — either a bare array of offer objects, or {"offers": [...]}. Each object's keys act like CSV column headers (e.g. [{"name":"Summer Kit","category":"Skincare","priority":1,"audience":"DOI Email Targets"}]). Provide this OR csv_text, not both.`),
+      start_date:       z.string().optional().describe(`Default start date applied to every offer whose CSV row / JSON object doesn't specify its own. Accepts ISO 8601 datetime ("2026-08-25T00:00:00Z") or plain date ("2026-08-25"). If omitted here AND absent per row, falls back to today UTC. ALWAYS confirm this with the user — an offer active before the intended launch date can leak a campaign early.`),
+      end_date:         z.string().optional().describe(`Default end date applied to every offer whose CSV row / JSON object doesn't specify its own. Accepts ISO 8601 datetime or plain date. If omitted here AND absent per row, falls back to today + 7 days UTC. ALWAYS confirm this with the user — the decision engine silently skips expired offers, so a wrong end_date is invisible in production until someone notices the offer isn't showing.`),
       lifecycle_status: z.enum(["draft","live","archived"]).default("draft"),
       dry_run:          boolish().describe("Returns full JSON payloads without calling the API. eligibility_rule/audience columns are shown unresolved (no lookups performed) since dry_run never makes API calls."),
       confirmed:        boolish().describe("Set to true to execute the write. Leave false to preview."),
@@ -1463,7 +1475,7 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
       limit:            z.number().int().min(1).max(200).default(25).describe("Process at most this many rows in this call. Default 25 — chosen so the soft 45s deadline finishes well below Adobe's 60s function cap even when the sandbox schema forces per-item validation. Set higher only if you know your CSV is small and validation is cheap."),
       access_token:     z.string().optional().describe("Bearer token — optional, server will auto-mint if missing"),
     },
-    wrap(async ({ csv_text, json_text, lifecycle_status, dry_run, confirmed, chunk_size, offset, limit, access_token }) => {
+    wrap(async ({ csv_text, json_text, start_date, end_date, lifecycle_status, dry_run, confirmed, chunk_size, offset, limit, access_token }) => {
       if (!csv_text && !json_text) throw new Error("Provide either csv_text or json_text.");
       if (csv_text && json_text) throw new Error("Provide only one of csv_text or json_text, not both.");
 
@@ -1485,7 +1497,16 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
       const colMap    = {};
       for (const c of columns) colMap[colLower(c)] = c;
       const findCol   = keys => { const k = keys.find(k => colMap[k]); return k ? colMap[k] : null; };
-      const { startDate: defStart, endDate: defEnd } = defaultDateRange();
+
+      // Date resolution priority: CSV row column > tool param > safe default (today → today+7d).
+      // Tool params come in as ISO/plain-date strings; normalize once so per-row lookups stay cheap.
+      const { startDate: safeStart, endDate: safeEnd } = defaultDateRange();
+      const toolStartIso = start_date ? toIsoDate(start_date) : null;
+      const toolEndIso   = end_date   ? toIsoDate(end_date)   : null;
+      if (start_date && !toolStartIso) throw new Error(`start_date "${start_date}" is not a valid ISO date. Use "YYYY-MM-DD" or a full ISO datetime.`);
+      if (end_date   && !toolEndIso)   throw new Error(`end_date "${end_date}" is not a valid ISO date. Use "YYYY-MM-DD" or a full ISO datetime.`);
+      const defStart = toolStartIso || safeStart;
+      const defEnd   = toolEndIso   || safeEnd;
 
       const nameCol  = findCol(["name","offer_name","title","item_name"]);
       const descCol  = findCol(["description","desc","summary"]);
@@ -1566,11 +1587,32 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
       if (resolutionErrors.length)
         return { content: [{ type: "text", text: `❌ Could not resolve eligibility_rule/audience for ${resolutionErrors.length} row(s):\n${resolutionErrors.map(e => `  • ${e}`).join("\n")}` }] };
 
+      // Surface the effective date window + its source so the user can catch
+      // a stale/default window before it silently expires offers in production.
+      const startSource = startCol ? "CSV column" : (toolStartIso ? "tool param" : "default (today UTC)");
+      const endSource   = endCol   ? "CSV column" : (toolEndIso   ? "tool param" : "default (today + 7 days UTC)");
+      const startDefaulted = !startCol && !toolStartIso;
+      const endDefaulted   = !endCol   && !toolEndIso;
+      const startsShown = startCol ? [...new Set(payloads.map(p => p.payload._experience.decisioning.decisionitem.itemCalendarConstraints.startDate))] : [defStart];
+      const endsShown   = endCol   ? [...new Set(payloads.map(p => p.payload._experience.decisioning.decisionitem.itemCalendarConstraints.endDate))]   : [defEnd];
+      const startLine = startsShown.length === 1 ? startsShown[0] : `${startsShown.length} distinct values across rows (see per-row payloads)`;
+      const endLine   = endsShown.length   === 1 ? endsShown[0]   : `${endsShown.length} distinct values across rows (see per-row payloads)`;
+      const dateWarn = (startDefaulted || endDefaulted)
+        ? `\n⚠️ ${startDefaulted && endDefaulted ? "Both start_date and end_date use" : (startDefaulted ? "start_date uses" : "end_date uses")} the safety-net default. Confirm this matches your intended campaign window — the decision engine silently skips offers outside this window in production. Pass start_date / end_date params (or add columns to the CSV) to override.`
+        : "";
+      const dateBlock =
+`📅 Date window (itemCalendarConstraints — controls when offers are eligible for delivery):
+   Start: ${startLine}  (source: ${startSource})
+   End  : ${endLine}  (source: ${endSource})${dateWarn}`;
+
       if (dry_run) {
         const previewPayloads = payloads.slice(0, Math.min(10, payloads.length));
         const truncated = payloads.length > previewPayloads.length;
         return { content: [{ type: "text", text:
 `🔍 DRY RUN — ${payloads.length} offers would be created (window: ${windowLabel}, status: ${lifecycle_status}):
+
+${dateBlock}
+
 ${previewPayloads.map((p,i) => `Row ${startIdx + i + 1}: "${p.name}"\n${JSON.stringify(p.payload, null, 2)}`).join("\n\n")}
 ${truncated ? `\n... (${payloads.length - previewPayloads.length} more rows in this window not shown)` : ""}
 
@@ -1583,6 +1625,9 @@ Call again with dry_run: false and confirmed: true to execute.` }] };
 Status   : ${lifecycle_status}
 Sandbox  : ${cfg.SANDBOX_NAME}
 Catalog  : ${cfg.ITEM_CATALOG_ID}
+
+${dateBlock}
+
 ${eligCount ? `Eligibility rule attached: ${eligCount} offer(s)\n` : ""}${audCount ? `Audience attached: ${audCount} offer(s) (eligibility rule created/reused per distinct audience)\n` : ""}
 OFFER NAMES:
 ${payloads.slice(0, 10).map((p,i) => `  ${startIdx + i + 1}. ${p.name}`).join("\n")}${payloads.length > 10 ? `\n  ... (${payloads.length - 10} more)` : ""}
