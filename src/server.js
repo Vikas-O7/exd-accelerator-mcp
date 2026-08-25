@@ -959,8 +959,15 @@ function pqlToUiModel(pql, tenantId) {
   let uiModelObj;
   const trimmed = pql.trim();
   if (trimmed.toLowerCase() === "all") {
-    // Preserved exactly as the original confirmed "all offers" default.
-    return { uiModel: `{"operator":"exists","value":{"left":"_experience.decisioning.decisionitem.itemName"}}`, warning: null };
+    // "all" is a documented shorthand, but it's almost never what a caller
+    // actually wants when scoping a collection to a batch of recently-loaded
+    // items — the constraint matches every named offer in the entire catalog,
+    // not just the recent ones. Surface an explicit warning so the confirmation
+    // card gives the caller a chance to course-correct before committing.
+    return {
+      uiModel: `{"operator":"exists","value":{"left":"_experience.decisioning.decisionitem.itemName"}}`,
+      warning: `Filter "all" matches EVERY offer in this catalog — not only recently-loaded items. If you intended to scope this collection to a specific batch (e.g., items just created from a CSV), use an explicit filter such as sku.startsWith("YOUR-PREFIX"), category.equals("YOUR-CATEGORY"), or itemName.startsWith("YOUR-BATCH-NAME") before confirming.`
+    };
   }
   try {
     const { ast, fullyConsumed } = parsePqlBoolean(trimmed);
@@ -1662,7 +1669,7 @@ ${hasMore
     {
       name:              z.string().describe("Collection display name"),
       description:       z.string().default(""),
-      filter_expression: z.string().describe(`Filter as a PQL-like expression, or "all" for every offer in the catalog. Examples: 'category.equals("Skincare")', 'itemPriority.greaterThan(3)', 'category.contains("Skin") or itemPriority.greaterThan(3) or itemTags.isNotNull()'. Field names without a prefix are resolved automatically: itemName/itemDescription/itemPriority/itemTags/itemCalendarConstraints → OOB decision-item fields, anything else → tenant custom fields.`),
+      filter_expression: z.string().describe(`Filter as a PQL-like expression that will be evaluated against every offer in the catalog (not just recently-created ones). To scope a collection to a batch of items you just loaded, use a unique attribute those items share — SKU prefix, category, tag, or itemName pattern. Only use "all" when you genuinely want every offer in the catalog. Examples: 'sku.startsWith("SKR-2026-")' (recommended for CSV-loaded batches), 'category.equals("Skincare")', 'itemPriority.greaterThan(3)', 'category.contains("Skin") or itemPriority.greaterThan(3) or itemTags.isNotNull()'. Field names without a prefix are resolved automatically: itemName/itemDescription/itemPriority/itemTags/itemCalendarConstraints → OOB decision-item fields, anything else → tenant custom fields.`),
       confirmed:         boolish().describe("Set to true to execute the write."),
       access_token:      z.string().optional(),
     },
