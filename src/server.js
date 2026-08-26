@@ -1309,9 +1309,29 @@ headers on the MCP connection.` }] };
 }
 
 // ─── MCP SERVER FACTORY ───────────────────────────────────────────────────────
+// Server-level guidance surfaced by MCP clients as system-prompt context to the LLM.
+// This fires BEFORE any tool selection, so it can steer decisions the LLM would
+// otherwise silently default on. Kept short and load-bearing — every line has to
+// earn its spot in a limited system-prompt budget.
+const SERVER_INSTRUCTIONS = `This MCP wraps Adobe Experience Decisioning APIs. A few decisions are the USER's to make explicitly — never infer them from context, and never pick a default silently. When the user's request is ambiguous on any of these, STOP and ask before writing.
+
+1. AUDIENCE / ELIGIBILITY ATTACH POINT. When the user says something like "target audience X for these offers", they have TWO equally valid choices in Adobe Experience Decisioning:
+     • Offer-level (attach_offer_eligibility_rule) — each offer carries its own eligibility. Use when different offers in the same collection need different targeting.
+     • Strategy-level (create_selection_strategy's eligibility_rule_id) — one rule gates the whole collection. Use when every offer shares the same audience gate.
+   These are architecturally different, and teams pick based on their targeting model — not on tool convenience. The phrase "for these offers" does NOT mean the user chose offer-level; it just names the scope. ALWAYS ASK the user which pattern they want, showing the one-line tradeoff, and wait for their answer before calling either tool. Do not present just one path.
+
+2. OFFER DATE WINDOW. When the user asks bulk_create_offers to load offers, always confirm the intended start_date and end_date with them explicitly first. The tool has a 7-day safety default — that exists to catch mistakes, not to be treated as a business decision. If the user hasn't stated a campaign window, ask.
+
+3. CONFIRMATION ON WRITES. Every state-changing tool returns a preview and refuses to commit until you re-invoke with confirmed: true. Do not chain multiple confirmed:true writes without pausing on each preview — the user should see and approve each one.
+
+Reads (list_*, get_*, parse_csv_and_suggest, get_setup_summary, etc.) have no gate — explore freely.`;
+
 export function buildMcpServer(initialConfig = {}) {
   const config = { ...DEFAULTS, ...initialConfig };
-  const server = new McpServer({ name: "exd-accelerator", version: "2.0.0" });
+  const server = new McpServer(
+    { name: "exd-accelerator", version: "2.0.0" },
+    { instructions: SERVER_INSTRUCTIONS },
+  );
 
   // Tool helper: resolves token and validates required config before any API call.
   const requireApiConfig = async (override) => {
@@ -1868,7 +1888,9 @@ uiModel attached: ${uiModel ? "yes" : "no"}${warning ? ` (⚠️  ${warning})` :
 
   // ════════ TOOL 7 — create_selection_strategy ═════════════════════════════════
   server.tool("create_selection_strategy",
-    `Wire a collection, eligibility rule, and ranking formula into a selection strategy. Requires confirmed: true to execute.
+    `🛑 STOP AND CHECK BEFORE CALLING with eligibility_rule_id. If the user asked to target an audience/eligibility for this collection but did NOT explicitly choose strategy-level (this tool's eligibility_rule_id) over offer-level (attach_offer_eligibility_rule), ask them first: "Do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?" and wait for their answer. Calling this tool with a rule_id when the user didn't choose it means you picked for them.
+
+Wire a collection, eligibility rule, and ranking formula into a selection strategy. Requires confirmed: true to execute.
 
 The eligibility_rule_id param gates the WHOLE collection under one rule — an alternative to offer-level eligibility (attach_offer_eligibility_rule) that instead gates each offer individually. Both are valid ExD patterns:
   • Strategy-level here: one rule, one write, same eligibility across every offer in the collection.
@@ -3785,7 +3807,9 @@ ${hasMore
 
   // ════════ TOOL 44 — attach_offer_eligibility_rule ════════════════════════════
   server.tool("attach_offer_eligibility_rule",
-    `Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.
+    `🛑 STOP AND CHECK BEFORE CALLING. Before invoking this tool, verify the user has EXPLICITLY chosen offer-level (this tool) over strategy-level (create_selection_strategy's eligibility_rule_id). If they only said "target audience X for these offers" or similar, they have NOT chosen — the phrase names the scope, not the attach point. Ask them first: "Do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?" and wait for their answer. Only proceed here after they say offer-level.
+
+Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.
 
 Where to put eligibility in ExD — user's choice, ASK when unspecified. Adobe Experience Decisioning supports two equally valid patterns for gating who sees offers, and the user picks based on their targeting model:
   1) OFFER-LEVEL (this tool): each offer carries its own eligibility. Use when different offers in the same collection target different audiences — tiered discounts by membership level, geo-restricted variants, opt-in-required items, etc. Also the right tool when adding/removing a rule from an existing offer without rebuilding the strategy.
