@@ -1902,12 +1902,29 @@ Users pick based on their model — do not assume. If the user hasn't stated whi
       description:         z.string().default(""),
       collection_id:       z.string().describe("ID of the item collection e.g. dps:item-collection:xxxxx"),
       eligibility_rule_id: z.string().optional().describe("ID of an eligibility rule that gates the whole collection with a single reference. This is the strategy-level targeting pattern (one rule for all offers in the collection). The alternative — offer-level eligibility via attach_offer_eligibility_rule — is equally valid; the user chooses. Omit here if the user wants offer-level targeting, or if every profile should see every offer."),
+      user_explicitly_chose_strategy_level: boolish().optional().describe(`REQUIRED confirmation when eligibility_rule_id is provided (ignored otherwise). Set to TRUE only if the user has ALREADY said something like "strategy level" / "one rule for the whole collection" / "on the strategy" in this conversation. Set to FALSE if you are inferring strategy-level from wording like "target audience X for these offers" — that phrase names scope, not attach point. When FALSE while eligibility_rule_id is set, this tool refuses and returns the exact question to ask the user. This is a hard schema-level guard; do not set true unless the user actually stated the choice.`),
       ranking_formula_id:  z.string().optional().describe("ID of the ranking formula. Omit for static priority."),
       priority:            z.number().default(1).describe("Static priority score (1 = highest) when no ranking formula is set"),
       confirmed:           boolish(),
       access_token:        z.string().optional(),
     },
-    wrap(async ({ name, description, collection_id, eligibility_rule_id, ranking_formula_id, priority, confirmed, access_token }) => {
+    wrap(async ({ name, description, collection_id, eligibility_rule_id, user_explicitly_chose_strategy_level, ranking_formula_id, priority, confirmed, access_token }) => {
+      if (eligibility_rule_id && !user_explicitly_chose_strategy_level) {
+        return { content: [{ type: "text", text: `⚠️ ASK THE USER FIRST — attach point not confirmed.
+
+Adobe Experience Decisioning supports TWO equally valid patterns for gating offers with an audience or rule. The user must pick — do not infer from "for these offers" wording (that phrase names scope, not the attach point):
+
+  1. STRATEGY-LEVEL (this tool, via eligibility_rule_id) — one eligibility rule gates the whole collection. Simpler; single write.
+  2. OFFER-LEVEL (attach_offer_eligibility_rule) — each offer carries its own eligibility. Best when different offers should target different audiences.
+
+Please ask the user this question verbatim:
+  "For this audience, do you want the eligibility at the STRATEGY level (one rule gates the whole collection — simpler) or at the OFFER level (each offer carries its own — allows differentiated targeting later)?"
+
+Wait for their answer.
+  - If they say strategy-level: call this tool again with user_explicitly_chose_strategy_level=true.
+  - If they say offer-level: omit eligibility_rule_id here (create the strategy without eligibility) and use attach_offer_eligibility_rule to gate the offers instead.` }] };
+      }
+
       const { cfg, token } = await requireApiConfig({ access_token });
       const check = await needsConfirmation(server, confirmed,
 `SELECTION STRATEGY TO CREATE:
@@ -3822,10 +3839,27 @@ Operational note: this tool issues one PATCH per offer ID. Passing 20+ offer IDs
       offer_ids:           z.array(z.string()).min(1).describe("Offer item ID(s) or exact offer name(s) to attach eligibility to, or remove it from. Names are resolved automatically; a name matching more than one offer fails with an error listing the matches so you can specify by ID instead."),
       eligibility_rule_id: z.string().optional().describe(`Decision/eligibility rule ID or exact rule name to attach. Mutually exclusive with audience. Omit both to detach any existing offer-level eligibility (resets itemConstraints to profileConstraintType: "none"). Names are resolved automatically; an ambiguous name fails with an error listing the matches.`),
       audience:            z.string().optional().describe(`Audience (Real-Time CDP segment) ID or exact name to restrict eligibility to. Mutually exclusive with eligibility_rule_id. Audiences are a separate resource from eligibility rules — under the hood this attaches an auto-generated eligibility rule (named "Audience: <name>", reused on repeat calls rather than duplicated) that checks segment membership.`),
+      user_explicitly_chose_offer_level: boolish().describe(`REQUIRED confirmation that the user picked the attach point. Set to TRUE only if the user has ALREADY said something like "offer level" / "per-offer" / "attach to each offer" in this conversation. Set to FALSE if you are inferring offer-level from wording like "target audience X for these offers" — that phrase only names scope, not attach point. When FALSE, this tool refuses and returns the exact question you should ask the user. This is a hard schema-level guard; do not set true unless the user actually stated the choice.`),
       confirmed:           boolish(),
       access_token:        z.string().optional(),
     },
-    wrap(async ({ offer_ids, eligibility_rule_id, audience, confirmed, access_token }) => {
+    wrap(async ({ offer_ids, eligibility_rule_id, audience, user_explicitly_chose_offer_level, confirmed, access_token }) => {
+      if (!user_explicitly_chose_offer_level) {
+        return { content: [{ type: "text", text: `⚠️ ASK THE USER FIRST — attach point not confirmed.
+
+Adobe Experience Decisioning supports TWO equally valid patterns for gating offers with an audience or rule. The user must pick — do not infer from "for these offers" wording (that phrase names scope, not the attach point):
+
+  1. OFFER-LEVEL (this tool) — each offer carries its own eligibility. Best when different offers in the collection should target different audiences.
+  2. STRATEGY-LEVEL (create_selection_strategy's eligibility_rule_id) — one eligibility rule gates the whole collection. Simpler; single write.
+
+Please ask the user this question verbatim:
+  "For this audience, do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?"
+
+Wait for their answer.
+  - If they say offer-level: call this tool again with user_explicitly_chose_offer_level=true.
+  - If they say strategy-level: use create_selection_strategy with eligibility_rule_id instead (that tool has its own confirmation param, user_explicitly_chose_strategy_level).` }] };
+      }
+
       if (eligibility_rule_id && audience)
         return { content: [{ type: "text", text: "❌ Provide only one of eligibility_rule_id or audience, not both." }] };
 
