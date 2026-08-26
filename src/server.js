@@ -1493,7 +1493,16 @@ Requires confirmed: true to execute — previews payloads first. Use dry_run: tr
       const rows      = allRows.slice(startIdx, endIdx);
       const windowLabel = `rows ${startIdx + 1}-${endIdx} of ${totalRows}`;
 
+      // colLower: case-insensitive key used ONLY for matching well-known columns
+      // (name/description/dates/eligibility/audience) against caller CSVs written in
+      // any case. Used for lookups; never emitted into the XDM payload.
+      //
+      // colKey: sanitized key used for the custom-field XDM payload. Preserves the
+      // caller's original casing so a CSV column named "discountPct" writes to
+      // _tenant.discountPct (matching a camelCase schema field), not the lowercased
+      // "_tenant.discountpct" (which fails schema validation).
       const colLower  = col => col.toLowerCase().replace(/[^a-z0-9_]/g, "_");
+      const colKey    = col => col.replace(/[^a-zA-Z0-9_]/g, "_");
       const colMap    = {};
       for (const c of columns) colMap[colLower(c)] = c;
       const findCol   = keys => { const k = keys.find(k => colMap[k]); return k ? colMap[k] : null; };
@@ -1530,10 +1539,11 @@ Requires confirmed: true to execute — previews payloads first. Use dry_run: tr
         const oobKeys   = new Set([colLower(nameCol||""),colLower(descCol||""),colLower(prioCol||""),colLower(startCol||""),colLower(endCol||""),colLower(eligCol||""),colLower(audCol||""),"id"]);
         const custom    = {};
         for (const col of columns) {
-          const key = colLower(col);
-          if (!oobKeys.has(key) && row[col] !== undefined && row[col] !== "") {
+          const matchKey   = colLower(col);
+          const payloadKey = colKey(col);
+          if (!oobKeys.has(matchKey) && row[col] !== undefined && row[col] !== "") {
             const n = parseFloat(row[col]);
-            custom[key] = !isNaN(n) && /^-?\d+(\.\d+)?$/.test(String(row[col]).trim()) ? n : row[col];
+            custom[payloadKey] = !isNaN(n) && /^-?\d+(\.\d+)?$/.test(String(row[col]).trim()) ? n : row[col];
           }
         }
 
@@ -1858,12 +1868,14 @@ uiModel attached: ${uiModel ? "yes" : "no"}${warning ? ` (⚠️  ${warning})` :
 
   // ════════ TOOL 7 — create_selection_strategy ═════════════════════════════════
   server.tool("create_selection_strategy",
-    "Wire a collection, eligibility rule, and ranking formula into a selection strategy. Requires confirmed: true to execute.",
+    `Wire a collection, eligibility rule, and ranking formula into a selection strategy. Requires confirmed: true to execute.
+
+✅ THIS IS THE RIGHT PLACE FOR COLLECTION-WIDE TARGETING. When one audience or one eligibility rule applies to every offer in a collection, set eligibility_rule_id here — the strategy's eligibility governs the entire collection with a single reference. Use create_eligibility_rule to wrap a Real-Time CDP audience into a rule first, then pass that rule's ID here. This is one write, and scales cleanly regardless of collection size. Do NOT loop attach_offer_eligibility_rule over every offer to achieve the same effect — that path is for offers that need DIFFERENT eligibility from their peers in the collection, and hits the 60s function timeout at 20+ offers.`,
     {
       name:                z.string(),
       description:         z.string().default(""),
       collection_id:       z.string().describe("ID of the item collection e.g. dps:item-collection:xxxxx"),
-      eligibility_rule_id: z.string().optional().describe("ID of the eligibility rule. Omit for all visitors."),
+      eligibility_rule_id: z.string().optional().describe("ID of the eligibility rule that gates the whole collection. Use this for collection-wide audience targeting: wrap the audience into a rule via create_eligibility_rule first, then pass the rule ID here. Omit only if every profile should see every offer in this strategy."),
       ranking_formula_id:  z.string().optional().describe("ID of the ranking formula. Omit for static priority."),
       priority:            z.number().default(1).describe("Static priority score (1 = highest) when no ranking formula is set"),
       confirmed:           boolish(),
@@ -3769,7 +3781,9 @@ ${hasMore
 
   // ════════ TOOL 44 — attach_offer_eligibility_rule ════════════════════════════
   server.tool("attach_offer_eligibility_rule",
-    `Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.`,
+    `Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.
+
+⚠️ WHEN NOT TO USE THIS TOOL: If the SAME audience or eligibility rule applies to every offer in a collection, DO NOT use this tool. Instead, put the eligibility on the SELECTION STRATEGY (via create_selection_strategy's eligibility_rule_id) — a strategy's eligibility governs the entire collection with a single rule, and one write instead of N. This tool is for the rarer case where different offers in the same collection need different eligibility (e.g. tiered discounts per membership level). Attaching the same audience to 20+ offers one-by-one WILL hit the 60s function timeout and drop the connection — the tool exists but is not the right call for whole-collection targeting.`,
     {
       offer_ids:           z.array(z.string()).min(1).describe("Offer item ID(s) or exact offer name(s) to attach eligibility to, or remove it from. Names are resolved automatically; a name matching more than one offer fails with an error listing the matches so you can specify by ID instead."),
       eligibility_rule_id: z.string().optional().describe(`Decision/eligibility rule ID or exact rule name to attach. Mutually exclusive with audience. Omit both to detach any existing offer-level eligibility (resets itemConstraints to profileConstraintType: "none"). Names are resolved automatically; an ambiguous name fails with an error listing the matches.`),
