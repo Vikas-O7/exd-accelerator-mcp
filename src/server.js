@@ -1870,12 +1870,16 @@ uiModel attached: ${uiModel ? "yes" : "no"}${warning ? ` (⚠️  ${warning})` :
   server.tool("create_selection_strategy",
     `Wire a collection, eligibility rule, and ranking formula into a selection strategy. Requires confirmed: true to execute.
 
-✅ THIS IS THE RIGHT PLACE FOR COLLECTION-WIDE TARGETING. When one audience or one eligibility rule applies to every offer in a collection, set eligibility_rule_id here — the strategy's eligibility governs the entire collection with a single reference. Use create_eligibility_rule to wrap a Real-Time CDP audience into a rule first, then pass that rule's ID here. This is one write, and scales cleanly regardless of collection size. Do NOT loop attach_offer_eligibility_rule over every offer to achieve the same effect — that path is for offers that need DIFFERENT eligibility from their peers in the collection, and hits the 60s function timeout at 20+ offers.`,
+The eligibility_rule_id param gates the WHOLE collection under one rule — an alternative to offer-level eligibility (attach_offer_eligibility_rule) that instead gates each offer individually. Both are valid ExD patterns:
+  • Strategy-level here: one rule, one write, same eligibility across every offer in the collection.
+  • Offer-level via attach_offer_eligibility_rule: per-offer rules, allows differentiated targeting within one collection.
+
+Users pick based on their model — do not assume. If the user hasn't stated which pattern they want, ASK before creating the strategy, and mention the tradeoff (uniform vs differentiated eligibility).`,
     {
       name:                z.string(),
       description:         z.string().default(""),
       collection_id:       z.string().describe("ID of the item collection e.g. dps:item-collection:xxxxx"),
-      eligibility_rule_id: z.string().optional().describe("ID of the eligibility rule that gates the whole collection. Use this for collection-wide audience targeting: wrap the audience into a rule via create_eligibility_rule first, then pass the rule ID here. Omit only if every profile should see every offer in this strategy."),
+      eligibility_rule_id: z.string().optional().describe("ID of an eligibility rule that gates the whole collection with a single reference. This is the strategy-level targeting pattern (one rule for all offers in the collection). The alternative — offer-level eligibility via attach_offer_eligibility_rule — is equally valid; the user chooses. Omit here if the user wants offer-level targeting, or if every profile should see every offer."),
       ranking_formula_id:  z.string().optional().describe("ID of the ranking formula. Omit for static priority."),
       priority:            z.number().default(1).describe("Static priority score (1 = highest) when no ranking formula is set"),
       confirmed:           boolish(),
@@ -3783,7 +3787,13 @@ ${hasMore
   server.tool("attach_offer_eligibility_rule",
     `Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.
 
-⚠️ WHEN NOT TO USE THIS TOOL: If the SAME audience or eligibility rule applies to every offer in a collection, DO NOT use this tool. Instead, put the eligibility on the SELECTION STRATEGY (via create_selection_strategy's eligibility_rule_id) — a strategy's eligibility governs the entire collection with a single rule, and one write instead of N. This tool is for the rarer case where different offers in the same collection need different eligibility (e.g. tiered discounts per membership level). Attaching the same audience to 20+ offers one-by-one WILL hit the 60s function timeout and drop the connection — the tool exists but is not the right call for whole-collection targeting.`,
+Where to put eligibility in ExD — user's choice, ASK when unspecified. Adobe Experience Decisioning supports two equally valid patterns for gating who sees offers, and the user picks based on their targeting model:
+  1) OFFER-LEVEL (this tool): each offer carries its own eligibility. Use when different offers in the same collection target different audiences — tiered discounts by membership level, geo-restricted variants, opt-in-required items, etc. Also the right tool when adding/removing a rule from an existing offer without rebuilding the strategy.
+  2) STRATEGY-LEVEL (create_selection_strategy's eligibility_rule_id): one rule gates the whole collection. Use when every offer in the collection shares the same audience gate.
+
+If the user asks for audience/eligibility targeting on a collection and hasn't specified which pattern, PRESENT BOTH OPTIONS with a one-line tradeoff and let them choose. Do not assume — teams use both.
+
+Operational note: this tool issues one PATCH per offer ID. Passing 20+ offer IDs in one call can approach the 60s function timeout — if the user chooses this pattern for a large batch, chunk into groups of ~15 across multiple calls.`,
     {
       offer_ids:           z.array(z.string()).min(1).describe("Offer item ID(s) or exact offer name(s) to attach eligibility to, or remove it from. Names are resolved automatically; a name matching more than one offer fails with an error listing the matches so you can specify by ID instead."),
       eligibility_rule_id: z.string().optional().describe(`Decision/eligibility rule ID or exact rule name to attach. Mutually exclusive with audience. Omit both to detach any existing offer-level eligibility (resets itemConstraints to profileConstraintType: "none"). Names are resolved automatically; an ambiguous name fails with an error listing the matches.`),
