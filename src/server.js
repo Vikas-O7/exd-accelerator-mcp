@@ -1477,7 +1477,7 @@ Next: Say "create offers" to bulk-create from your CSV.` }] };
   server.tool("bulk_create_offers",
     `Bulk-create ExD offer items from CSV rows or a JSON array of offer objects. Each row/object becomes one offer. Provide exactly one of csv_text or json_text. Optional per-row eligibility_rule / audience columns restrict that offer's eligibility (at most one of the two per row) — same three-way choice (none / decision rule / audience) as attach_offer_eligibility_rule.
 
-📅 EVERY OFFER NEEDS A START AND END DATE ("itemCalendarConstraints" in Adobe Experience Decisioning). These control when the offer is eligible for delivery: before start_date the decision engine treats the offer as not-yet-active; after end_date it treats the offer as expired and silently skips it during selection — regardless of the offer's eligibility rule, ranking score, or lifecycle status. Missing or wrong dates are one of the most common reasons an offer never surfaces in production, so decide them deliberately.
+EVERY OFFER NEEDS A START AND END DATE ("itemCalendarConstraints" in Adobe Experience Decisioning). These control when the offer is eligible for delivery: before start_date the decision engine treats the offer as not-yet-active; after end_date it treats the offer as expired and silently skips it during selection — regardless of the offer's eligibility rule, ranking score, or lifecycle status. Missing or wrong dates are one of the most common reasons an offer never surfaces in production, so decide them deliberately.
 
 Date resolution priority (per row): CSV column ("start_date" / "end_date" or aliases) → tool param (start_date / end_date) → safe default (today UTC → today + 7 days UTC). ALWAYS ask the user for the actual campaign window before calling — the 7-day default is a safety net for testing, not a business decision. Longer campaigns (e.g. a summer sale ending 2026-09-01) must be specified explicitly. The confirmation preview shows the resolved window so the user can catch a mistake before execution.
 
@@ -1888,7 +1888,7 @@ uiModel attached: ${uiModel ? "yes" : "no"}${warning ? ` (⚠️  ${warning})` :
 
   // ════════ TOOL 7 — create_selection_strategy ═════════════════════════════════
   server.tool("create_selection_strategy",
-    `🛑 STOP AND CHECK BEFORE CALLING with eligibility_rule_id. If the user asked to target an audience/eligibility for this collection but did NOT explicitly choose strategy-level (this tool's eligibility_rule_id) over offer-level (attach_offer_eligibility_rule), ask them first: "Do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?" and wait for their answer. Calling this tool with a rule_id when the user didn't choose it means you picked for them.
+    `STOP AND CHECK BEFORE CALLING with eligibility_rule_id. If the user asked to target an audience/eligibility for this collection but did NOT explicitly choose strategy-level (this tool's eligibility_rule_id) over offer-level (attach_offer_eligibility_rule), ask them first: "Do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?" and wait for their answer. Calling this tool with a rule_id when the user didn't choose it means you picked for them.
 
 Wire a collection, eligibility rule, and ranking formula into a selection strategy. Requires confirmed: true to execute.
 
@@ -3824,7 +3824,7 @@ ${hasMore
 
   // ════════ TOOL 44 — attach_offer_eligibility_rule ════════════════════════════
   server.tool("attach_offer_eligibility_rule",
-    `🛑 STOP AND CHECK BEFORE CALLING. Before invoking this tool, verify the user has EXPLICITLY chosen offer-level (this tool) over strategy-level (create_selection_strategy's eligibility_rule_id). If they only said "target audience X for these offers" or similar, they have NOT chosen — the phrase names the scope, not the attach point. Ask them first: "Do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?" and wait for their answer. Only proceed here after they say offer-level.
+    `STOP AND CHECK BEFORE CALLING. Before invoking this tool, verify the user has EXPLICITLY chosen offer-level (this tool) over strategy-level (create_selection_strategy's eligibility_rule_id). If they only said "target audience X for these offers" or similar, they have NOT chosen — the phrase names the scope, not the attach point. Ask them first: "Do you want the eligibility at the OFFER level (each offer carries its own — allows differentiated targeting later) or at the STRATEGY level (one rule gates the whole collection — simpler)?" and wait for their answer. Only proceed here after they say offer-level.
 
 Attach (or remove) offer-level eligibility directly on one or more offer items — independent of any selection strategy. Choose exactly one of: a decision/eligibility rule, an audience, or neither (to detach). Sets/clears offer._experience.decisioning.decisionitem.itemConstraints. Works for a single offer (pass one ID or name) or many at once. Requires confirmed: true to execute.
 
