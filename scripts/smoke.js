@@ -193,8 +193,14 @@ async function runStdio() {
       "bulk_delete_offers errors cleanly when creds missing");
   }
 
-  // ── New attach_offer_eligibility_rule (tool 44) — detach path (no eligibility_rule_id lookup) hits the same confirmation guard ──
-  const attachAttempt = await send("tools/call", { name: "attach_offer_eligibility_rule", arguments: { offer_ids: ["dps:offer-item:smoketest"] } });
+  // ── attach_offer_eligibility_rule — schema-level guard (user_explicitly_chose_offer_level) fires first;
+  //    once satisfied, detach path (no rule/audience lookup) hits the confirmation guard, then credentials check.
+  const attachGuardAttempt = await send("tools/call", { name: "attach_offer_eligibility_rule", arguments: { offer_ids: ["dps:offer-item:smoketest"] } });
+  const attachGuardText = attachGuardAttempt.result?.content?.[0]?.text || "";
+  assert(attachGuardText.includes("ASK THE USER FIRST") || attachGuardText.includes("attach point not confirmed"),
+    "attach_offer_eligibility_rule refuses without user_explicitly_chose_offer_level");
+
+  const attachAttempt = await send("tools/call", { name: "attach_offer_eligibility_rule", arguments: { offer_ids: ["dps:offer-item:smoketest"], user_explicitly_chose_offer_level: true } });
   const attachText = attachAttempt.result?.content?.[0]?.text || "";
   if (HAS_CREDS) {
     assert(attachText.includes("CONFIRMATION REQUIRED"), "attach_offer_eligibility_rule (detach path) blocks without confirmed:true");
