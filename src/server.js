@@ -3932,5 +3932,392 @@ ${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).
     })
   );
 
+  // ════════ TOOL 48 — clone_eligibility_rule ═══════════════════════════════════
+  server.tool("clone_eligibility_rule",
+    "Clone an existing eligibility rule to a new name, applying string substitutions across name, description, PQL, and segmentModel. Use when create_eligibility_rule can't build a working AJO Rule Builder view for a complex PQL pattern — clone a rule that already works and swap the changing values. Preserves the source's segmentModel exactly, so the new rule renders identically in AJO's Rule Builder UI. Requires confirmed: true.",
+    {
+      source_rule_id: z.string().describe("Source rule ID (dps:eligibility-rule:...) or exact rule name to clone from"),
+      new_name:       z.string().describe("Display name for the new rule"),
+      substitutions:  z.record(z.string()).default({}).describe(`Find/replace pairs applied to the source name, description, PQL, and segmentModel (as JSON). Example: {"C3": "C4", "c3": "c4"}. Literal (not regex), case-sensitive.`),
+      description:    z.string().optional().describe("Description override. If omitted, uses the source's description with substitutions applied"),
+      confirmed:      boolish(),
+      access_token:   z.string().optional(),
+    },
+    wrap(async ({ source_rule_id, new_name, substitutions, description, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const resolve = await resolveEligibilityRuleIdentifier(source_rule_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+
+      let sourceBody = resolve.body;
+      if (!sourceBody) {
+        const getRes = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules/${resolve.id}`, "GET", dpsHeaders(token, cfg));
+        if (!getRes.ok)
+          return { content: [{ type: "text", text: `❌ Could not fetch source rule body (${getRes.status}):\n${JSON.stringify(getRes.body, null, 2)}` }] };
+        sourceBody = getRes.body;
+      }
+
+      const applySub = (s) => {
+        if (s == null) return s;
+        let out = String(s);
+        for (const [find, rep] of Object.entries(substitutions)) {
+          if (find === "") continue;
+          out = out.split(find).join(rep);
+        }
+        return out;
+      };
+
+      const newPql  = applySub(sourceBody?.condition?.value ?? "");
+      const newDesc = description !== undefined ? description : applySub(sourceBody?.description ?? "");
+      let newSegmentModel = null;
+      if (sourceBody?.segmentModel) {
+        try {
+          newSegmentModel = JSON.parse(applySub(JSON.stringify(sourceBody.segmentModel)));
+        } catch (e) {
+          return { content: [{ type: "text", text: `❌ Substitution produced invalid segmentModel JSON: ${e.message}` }] };
+        }
+      }
+
+      const newBody = {
+        name: new_name,
+        description: newDesc,
+        exdRule: sourceBody?.exdRule === true,
+        condition: sourceBody?.condition ? { ...sourceBody.condition, value: newPql } : { type: "PQL", format: "pql/text", value: newPql },
+        ...(newSegmentModel ? { segmentModel: newSegmentModel } : {}),
+      };
+
+      const check = await needsConfirmation(server, confirmed,
+`ELIGIBILITY RULE TO CLONE:
+  Source        : ${sourceBody?.name || resolve.id} (${resolve.id})
+  New name      : ${new_name}
+  Substitutions : ${Object.keys(substitutions).length ? Object.entries(substitutions).map(([k,v]) => `"${k}" → "${v}"`).join(", ") : "(none)"}
+  New PQL       : ${newPql}
+  Sandbox       : ${cfg.SANDBOX_NAME}
+
+segmentModel: ${newSegmentModel ? "cloned from source with substitutions applied — Rule Builder UI will render identically to source" : "not present on source — new rule will lack a Rule Builder view"}
+
+This will POST to /offer-rules.`);
+      if (check) return check;
+
+      const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules`, "POST", dpsHeaders(token, cfg), newBody);
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ Rule clone failed (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+      return { content: [{ type: "text", text:
+`✅ Eligibility rule cloned
+Source : ${sourceBody?.name || resolve.id}
+New    : ${new_name}
+ID     : ${res.body.id}
+PQL    : ${newPql}
+segmentModel: ${newSegmentModel ? "cloned intact from source" : "not present"}
+💡 Save this ID: ${res.body.id}` }] };
+    })
+  );
+
+  // ════════ TOOL 49 — bulk_clone_eligibility_rules ═════════════════════════════
+  server.tool("bulk_clone_eligibility_rules",
+    "Clone one source eligibility rule into multiple variants in a single call. Each variant supplies its own new_name and substitutions. Uses the same clone pattern as clone_eligibility_rule, so every variant's AJO Rule Builder view mirrors the source. skip_if_exists (default true) skips variants whose new_name already exists in the sandbox rather than duplicating. Chunked to stay under runtime limits. Requires confirmed: true.",
+    {
+      source_rule_id: z.string().describe("Source rule ID or exact rule name to clone from"),
+      variants: z.array(z.object({
+        new_name:      z.string().describe("Display name for this variant"),
+        substitutions: z.record(z.string()).default({}).describe("Find/replace pairs applied to this variant's clone"),
+        description:   z.string().optional().describe("Description override for this variant"),
+      })).min(1).describe("Variants to create — one clone per entry"),
+      skip_if_exists: boolish(true).describe("If true (default), variants whose new_name already exists are skipped rather than duplicated"),
+      confirmed:      boolish().describe("Set to true to execute the write."),
+      access_token:   z.string().optional(),
+    },
+    wrap(async ({ source_rule_id, variants, skip_if_exists, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const resolve = await resolveEligibilityRuleIdentifier(source_rule_id, token, cfg);
+      if (resolve.error) return { content: [{ type: "text", text: `❌ ${resolve.error}` }] };
+
+      let sourceBody = resolve.body;
+      if (!sourceBody) {
+        const getRes = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules/${resolve.id}`, "GET", dpsHeaders(token, cfg));
+        if (!getRes.ok)
+          return { content: [{ type: "text", text: `❌ Could not fetch source rule body (${getRes.status}):\n${JSON.stringify(getRes.body, null, 2)}` }] };
+        sourceBody = getRes.body;
+      }
+
+      let existingNames = new Set();
+      if (skip_if_exists) {
+        const { items, error } = await fetchAllItems(`${DEFAULTS.BASE_DPS_URL}/offer-rules?property=exdRule%3D%3Dtrue&`, dpsHeaders(token, cfg));
+        if (error) return { content: [{ type: "text", text: `❌ Could not list existing rules to check for duplicates ${error}` }] };
+        for (const r of items) if (r.name) existingNames.add(r.name);
+      }
+
+      const applySub = (s, subs) => {
+        if (s == null) return s;
+        let out = String(s);
+        for (const [find, rep] of Object.entries(subs)) {
+          if (find === "") continue;
+          out = out.split(find).join(rep);
+        }
+        return out;
+      };
+
+      const prepared = [];
+      const skipped  = [];
+      for (const v of variants) {
+        if (skip_if_exists && existingNames.has(v.new_name)) {
+          skipped.push(v.new_name);
+          continue;
+        }
+        const subs = v.substitutions || {};
+        const newPql  = applySub(sourceBody?.condition?.value ?? "", subs);
+        const newDesc = v.description !== undefined ? v.description : applySub(sourceBody?.description ?? "", subs);
+        let newSegmentModel = null;
+        if (sourceBody?.segmentModel) {
+          try { newSegmentModel = JSON.parse(applySub(JSON.stringify(sourceBody.segmentModel), subs)); }
+          catch (e) { return { content: [{ type: "text", text: `❌ Substitution produced invalid segmentModel JSON for "${v.new_name}": ${e.message}` }] }; }
+        }
+        prepared.push({
+          new_name: v.new_name,
+          subs,
+          body: {
+            name: v.new_name,
+            description: newDesc,
+            exdRule: sourceBody?.exdRule === true,
+            condition: sourceBody?.condition ? { ...sourceBody.condition, value: newPql } : { type: "PQL", format: "pql/text", value: newPql },
+            ...(newSegmentModel ? { segmentModel: newSegmentModel } : {}),
+          },
+        });
+      }
+
+      const check = await needsConfirmation(server, confirmed,
+`BULK CLONE ELIGIBILITY RULES
+  Source   : ${sourceBody?.name || resolve.id} (${resolve.id})
+  To create: ${prepared.length}${skipped.length ? `, skipping ${skipped.length} that already exist` : ""}
+  Sandbox  : ${cfg.SANDBOX_NAME}
+
+To create:
+${prepared.map((p, i) => `  ${i + 1}. ${p.new_name}  |  subs: ${Object.keys(p.subs).length ? Object.entries(p.subs).map(([k,v]) => `"${k}"→"${v}"`).join(", ") : "(none)"}`).join("\n")}
+${skipped.length ? `\nSkipped (already exist):\n${skipped.map(n => `  • ${n}`).join("\n")}` : ""}
+
+segmentModel: ${sourceBody?.segmentModel ? "cloned from source on each variant — Rule Builder UI will match source" : "not present on source — new rules will lack Rule Builder view"}
+
+This will POST ${prepared.length} new rules to /offer-rules.`);
+      if (check) return check;
+
+      const { results, errors } = await runChunked(prepared, async (p) => {
+        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-rules`, "POST", dpsHeaders(token, cfg), p.body);
+        const label = res.ok ? `${p.new_name} → ${res.body.id}` : p.new_name;
+        return { id: label, res };
+      });
+
+      return { content: [{ type: "text", text:
+`📦 BULK CLONE COMPLETE
+✅ Created : ${results.length}  |  ⏭️  Skipped : ${skipped.length}  |  ❌ Failed : ${errors.length}
+${results.map(n => `  ✅ ${n}`).join("\n")}
+${skipped.length ? `\nSkipped (already exist):\n${skipped.map(n => `  ⏭️  ${n}`).join("\n")}` : ""}
+${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 50 — list_tags ════════════════════════════════════════════════
+  server.tool("list_tags",
+    "List all item tags in the sandbox with pagination. Returns each tag's UUID and name — offer itemTags accepts UUIDs only, not names, so this is the lookup you need before bulk-tagging offers. Read-only.",
+    {
+      limit:        z.number().default(100),
+      offset:       z.number().default(0),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ limit, offset, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/tags?limit=${limit}&offset=${offset}`, "GET",
+        dpsHeaders(token, cfg)
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+
+      const items = extractItems(res.body);
+      if (!items.length)
+        return { content: [{ type: "text", text:
+`⚠️ 0 tags returned.
+Total reported by API : ${res.body.total ?? res.body.count ?? "unknown"}
+Raw response          : ${JSON.stringify(res.body, null, 2)}` }] };
+
+      return { content: [{ type: "text", text:
+`🏷️  Tags (${items.length} of ${res.body.total ?? res.body.count ?? "?"}):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${items.map(t => `  • ${t.name || "unnamed"} | UUID: ${t.id || t.instanceId || "?"}`).join("\n")}
+${res.body._links?.next ? `\nNext page: call with offset ${offset + limit}` : ""}` }] };
+    })
+  );
+
+  // ════════ TOOL 51 — create_tag ═══════════════════════════════════════════════
+  server.tool("create_tag",
+    "Create a new item tag in the sandbox and return its UUID. Requires confirmed: true. Fails if a tag with the same name already exists — use resolve_tag_names with create_if_missing: true for an upsert flow instead.",
+    {
+      name:         z.string().min(1).describe("Tag display name, e.g. 'weekend-offer-test'"),
+      description:  z.string().default(""),
+      confirmed:    boolish().describe("Set to true to execute the write."),
+      access_token: z.string().optional(),
+    },
+    wrap(async ({ name, description, confirmed, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const check = await needsConfirmation(server, confirmed,
+`TAG TO CREATE:
+  Name        : ${name}
+  Description : ${description || "(none)"}
+  Sandbox     : ${cfg.SANDBOX_NAME}
+
+This will POST to /tags.`);
+      if (check) return check;
+
+      const res = await apiCall(
+        `${DEFAULTS.BASE_DPS_URL}/tags`, "POST",
+        dpsHeaders(token, cfg),
+        { name, description }
+      );
+      if (!res.ok)
+        return { content: [{ type: "text", text: `❌ Tag creation failed (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+      const id = res.body.id || res.body.instanceId;
+      return { content: [{ type: "text", text:
+`✅ Tag created
+Name : ${name}
+UUID : ${id}
+💡 Save this UUID — offer itemTags accepts tag UUIDs only, not names.` }] };
+    })
+  );
+
+  // ════════ TOOL 52 — resolve_tag_names ════════════════════════════════════════
+  server.tool("resolve_tag_names",
+    "Resolve one or more tag names to their UUIDs in a single call. With create_if_missing: true, any names not already in the catalog are created on the fly (upsert). Idempotent — safe to call repeatedly. Returns a name → UUID map for use in itemTags.",
+    {
+      tag_names:         z.array(z.string()).min(1).describe("Tag display names to resolve"),
+      create_if_missing: boolish().describe("If true, create any names not found in the sandbox. If false (default), fail with a list of unresolved names."),
+      access_token:      z.string().optional(),
+    },
+    wrap(async ({ tag_names, create_if_missing, access_token }) => {
+      const { cfg, token } = await requireApiConfig({ access_token });
+      const { items, error } = await fetchAllItems(`${DEFAULTS.BASE_DPS_URL}/tags?`, dpsHeaders(token, cfg));
+      if (error) return { content: [{ type: "text", text: `❌ Could not list tags to resolve names ${error}` }] };
+
+      const byName = new Map();
+      for (const t of items) {
+        if (t.name) byName.set(t.name, t.id || t.instanceId);
+      }
+
+      const resolved = {};
+      const created  = [];
+      const missing  = [];
+      for (const nm of tag_names) {
+        if (byName.has(nm)) { resolved[nm] = byName.get(nm); continue; }
+        if (!create_if_missing) { missing.push(nm); continue; }
+        const res = await apiCall(
+          `${DEFAULTS.BASE_DPS_URL}/tags`, "POST",
+          dpsHeaders(token, cfg),
+          { name: nm, description: "" }
+        );
+        if (!res.ok)
+          return { content: [{ type: "text", text: `❌ Failed to create tag "${nm}" (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+        const newId = res.body.id || res.body.instanceId;
+        resolved[nm] = newId;
+        created.push(nm);
+      }
+
+      if (missing.length)
+        return { content: [{ type: "text", text:
+`❌ Tag(s) not found: ${missing.map(n => `"${n}"`).join(", ")}
+Re-call with create_if_missing: true to create them, or use create_tag directly.` }] };
+
+      return { content: [{ type: "text", text:
+`🏷️  Resolved ${tag_names.length} tag name(s):
+${Object.entries(resolved).map(([n, id]) => `  • ${n} → ${id}${created.includes(n) ? "  ✨ (created)" : ""}`).join("\n")}` }] };
+    })
+  );
+
+  // ════════ TOOL 53 — bulk_apply_tags_to_offers ════════════════════════════════
+  server.tool("bulk_apply_tags_to_offers",
+    "Apply tags to multiple offer items in one call. Accepts tag names (auto-resolved to UUIDs, and auto-created when create_missing_tags: true) and/or tag UUIDs. mode='add' merges with existing itemTags (deduped); 'replace' overwrites; 'remove' strips only the listed tags. Handles offers that don't yet have an itemTags field. Requires confirmed: true.",
+    {
+      offer_ids:           z.array(z.string()).min(1).describe("Offer item IDs (dps:offer-item:…) or exact offer names. Names are resolved automatically."),
+      tag_names:           z.array(z.string()).default([]).describe("Tag display names — resolved (and optionally created) automatically. Combine with tag_ids or use either alone."),
+      tag_ids:             z.array(z.string()).default([]).describe("Tag UUIDs — used verbatim, no lookup. Combine with tag_names or use either alone."),
+      mode:                z.enum(["add","replace","remove"]).default("add").describe("add = merge with existing tags (deduped); replace = overwrite itemTags entirely; remove = strip only the listed tags from each offer"),
+      create_missing_tags: boolish().describe("For tag_names not already in the catalog: create them (true) or fail with a list (false, default)."),
+      confirmed:           boolish().describe("Set to true to execute the write."),
+      access_token:        z.string().optional(),
+    },
+    wrap(async ({ offer_ids, tag_names, tag_ids, mode, create_missing_tags, confirmed, access_token }) => {
+      if (tag_names.length === 0 && tag_ids.length === 0)
+        return { content: [{ type: "text", text: "❌ Provide at least one of tag_names or tag_ids." }] };
+
+      const { cfg, token } = await requireApiConfig({ access_token });
+
+      const offerResolve = await resolveOfferIdentifiers(offer_ids, token, cfg);
+      if (offerResolve.error)
+        return { content: [{ type: "text", text: `❌ Could not resolve offer_ids: ${offerResolve.error}` }] };
+      const resolvedOfferIds = offerResolve.ids;
+
+      let resolvedTagIds = [...tag_ids];
+      let tagResolutionNote = "";
+      if (tag_names.length) {
+        const { items, error } = await fetchAllItems(`${DEFAULTS.BASE_DPS_URL}/tags?`, dpsHeaders(token, cfg));
+        if (error) return { content: [{ type: "text", text: `❌ Could not list tags to resolve names ${error}` }] };
+        const byName = new Map();
+        for (const t of items) if (t.name) byName.set(t.name, t.id || t.instanceId);
+        const missing = tag_names.filter(n => !byName.has(n));
+        if (missing.length && !create_missing_tags)
+          return { content: [{ type: "text", text: `❌ Tag(s) not found: ${missing.map(n => `"${n}"`).join(", ")}\nRe-call with create_missing_tags: true, or create them first.` }] };
+        const created = [];
+        for (const nm of missing) {
+          const res = await apiCall(
+            `${DEFAULTS.BASE_DPS_URL}/tags`, "POST",
+            dpsHeaders(token, cfg),
+            { name: nm, description: "" }
+          );
+          if (!res.ok)
+            return { content: [{ type: "text", text: `❌ Failed to create tag "${nm}" (${res.status}):\n${JSON.stringify(res.body, null, 2)}` }] };
+          const newId = res.body.id || res.body.instanceId;
+          byName.set(nm, newId);
+          created.push(nm);
+        }
+        for (const nm of tag_names) resolvedTagIds.push(byName.get(nm));
+        if (created.length) tagResolutionNote = `\n✨ Newly created tag(s): ${created.map(n => `"${n}"`).join(", ")}`;
+      }
+      resolvedTagIds = [...new Set(resolvedTagIds)];
+
+      const check = await needsConfirmation(server, confirmed,
+`OFFERS TO TAG: ${resolvedOfferIds.length}
+Mode    : ${mode}
+Tags    : ${resolvedTagIds.length} UUID(s) — ${resolvedTagIds.join(", ")}
+Sandbox : ${cfg.SANDBOX_NAME}${tagResolutionNote}
+
+${resolvedOfferIds.map((id, i) => `  ${i + 1}. ${id}${offer_ids[i] !== id ? ` (resolved from "${offer_ids[i]}")` : ""}`).join("\n")}
+
+This will PATCH ${resolvedOfferIds.length} offer-item(s)' itemTags.`);
+      if (check) return check;
+
+      const tagsPath = "/_experience/decisioning/decisionitem/itemTags";
+      const { results, errors } = await runChunked(resolvedOfferIds, async (id) => {
+        let nextTags;
+        if (mode === "replace") {
+          nextTags = resolvedTagIds;
+        } else {
+          const getRes = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${id}`, "GET", offerItemHeaders(token, cfg));
+          if (!getRes.ok) return { id, res: getRes };
+          const current = getRes.body?._experience?.decisioning?.decisionitem?.itemTags || [];
+          if (mode === "add") nextTags = [...new Set([...current, ...resolvedTagIds])];
+          else                nextTags = current.filter(t => !resolvedTagIds.includes(t));
+        }
+        const patch = [{ op: "add", path: tagsPath, value: nextTags }];
+        const res = await apiCall(`${DEFAULTS.BASE_DPS_URL}/offer-items/${id}`, "PATCH", offerItemHeaders(token, cfg), patch);
+        return { id, res };
+      });
+
+      return { content: [{ type: "text", text:
+`📦 BULK TAG ${mode.toUpperCase()} COMPLETE
+✅ Updated : ${results.length}  |  ❌ Failed: ${errors.length}
+${results.map(id => `  ✅ ${id}`).join("\n")}
+${errors.length ? `\nErrors:\n${errors.map(e => `  ❌ ${e.id} → ${e.error}`).join("\n")}` : ""}${tagResolutionNote}` }] };
+    })
+  );
+
   return server;
 }

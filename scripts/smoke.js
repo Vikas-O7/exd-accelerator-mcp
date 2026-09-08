@@ -68,7 +68,7 @@ async function runStdio() {
   child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 
   const list = await send("tools/list", {});
-  assert((list.result?.tools || []).length === 47, "stdio lists 47 tools (got " + (list.result?.tools?.length || 0) + ")");
+  assert((list.result?.tools || []).length === 53, "stdio lists 53 tools (got " + (list.result?.tools?.length || 0) + ")");
 
   // No-API tools: should work without credentials
   const csv = `name,category,discount_percent,priority\nSummer Kit,Skincare,20,1\nLoyalty 10,Discount,10,2`;
@@ -255,7 +255,7 @@ async function runHttp() {
   });
 
   const list = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-  assert((list.body?.result?.tools || []).length === 47, "http lists 47 tools (got " + (list.body?.result?.tools?.length || 0) + ")");
+  assert((list.body?.result?.tools || []).length === 53, "http lists 53 tools (got " + (list.body?.result?.tools?.length || 0) + ")");
 
   // Call a tool with credentials passed as headers (mimics how Coworker users will connect)
   if (HAS_CREDS) {
